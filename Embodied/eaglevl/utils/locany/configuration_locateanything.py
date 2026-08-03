@@ -10,6 +10,7 @@ from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
+from eaglevl.model.moon_vit_v2.configuration_moonvit_v2 import MoonViTV2Config
 logger = logging.get_logger(__name__)
 
 class MoonViTConfig(PretrainedConfig):
@@ -76,8 +77,14 @@ class LocateAnythingConfig(PretrainedConfig):
 
         if vision_config['model_type'] == 'moonvit':
             self.vision_config = MoonViTConfig(**vision_config)
+        elif vision_config['model_type'] == 'moonvit_v2':
+            self.vision_config = MoonViTV2Config(**vision_config)
         else:
-            raise ValueError('Unsupported model_type: {}. Only moonvit is supported.'.format(vision_config['model_type']))
+            raise ValueError(
+                'Unsupported model_type: {}. Only moonvit / moonvit_v2 are supported.'.format(
+                    vision_config['model_type']
+                )
+            )
 
 
         if text_config['architectures'][0] == 'Qwen2ForCausalLM':

@@ -1405,6 +1405,22 @@ def main():
             logger.info(f'Vision attn (scratch path): {vision_config._attn_implementation}')
             vision_model = MoonVitPretrainedModel.from_pretrained(
                 model_args.vision_path, torch_dtype=torch.bfloat16, config=vision_config)
+        elif vision_config.model_type == 'moonvit_v2':
+            logger.info('Loading MoonVit-V2...')
+            from eaglevl.model.moon_vit_v2.modeling_moonvit_v2 import (
+                MoonViTV2PretrainedModel,
+                is_flash_attn_4_available as _fa4_ok,
+            )
+            from transformers.utils import is_flash_attn_2_available as _fa2_ok
+            if _fa4_ok():
+                vision_config._attn_implementation = 'flash_attention_4'
+            elif _fa2_ok():
+                vision_config._attn_implementation = 'flash_attention_2'
+            else:
+                vision_config._attn_implementation = 'sdpa'
+            logger.info(f'Vision attn (scratch path): {vision_config._attn_implementation}')
+            vision_model = MoonViTV2PretrainedModel.from_pretrained(
+                model_args.vision_path, torch_dtype=torch.bfloat16, config=vision_config)
         else:
             raise ValueError(f"Unsupported vision model type: {vision_config.model_type}")
             

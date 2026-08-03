@@ -20,6 +20,7 @@ from peft import LoraConfig, get_peft_model
 from .configuration_locateanything import LocateAnythingConfig
 from .modeling_qwen2 import Qwen2ForCausalLM
 from .modeling_vit import MoonVitPretrainedModel, is_flash_attn_4_available
+from eaglevl.model.moon_vit_v2.modeling_moonvit_v2 import MoonViTV2PretrainedModel
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 from .mask_sdpa_utils import *
 from .mask_magi_utils import *
@@ -32,6 +33,29 @@ from .generate_utils import (
 )
 
 logger = logging.get_logger(__name__)
+
+
+def _resolve_moonvit_vision_attn(vision_config) -> str:
+    """FA4 -> FA2 -> SDPA (same for moonvit / moonvit_v2)."""
+    _vision_ok = {"flash_attention_4", "flash_attention_2", "sdpa", "eager"}
+    vision_attn_impl = getattr(vision_config, "_attn_implementation", None) or "flash_attention_4"
+    if vision_attn_impl not in _vision_ok:
+        logger.warning_once(
+            f"MoonViT does not support attn_implementation={vision_attn_impl!r}; "
+            "remapping to flash_attention_4/2 (or sdpa)."
+        )
+        vision_attn_impl = "flash_attention_4"
+    if vision_attn_impl == "flash_attention_4" and not is_flash_attn_4_available():
+        logger.warning_once(
+            "flash-attn-4 is not available for MoonViT inference; falling back to flash_attention_2/sdpa."
+        )
+        vision_attn_impl = "flash_attention_2"
+    if vision_attn_impl == "flash_attention_2" and not is_flash_attn_2_available():
+        logger.warning_once(
+            "flash_attn is not available for MoonViT inference; falling back to sdpa."
+        )
+        vision_attn_impl = "sdpa"
+    return vision_attn_impl
 
 
 LOCATEANYTHING_START_DOCSTRING = r"""
@@ -100,31 +124,19 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
         if vision_model is not None:
             self.vision_model = vision_model
         else:
-            if config.vision_config.model_type == 'moonvit':
-                # MoonViT supports flash_attention_4 / flash_attention_2 / sdpa / eager (not magi).
-                # from_pretrained(attn_implementation="magi") can leak "magi" into vision_config.
-                _vision_ok = {"flash_attention_4", "flash_attention_2", "sdpa", "eager"}
-                vision_attn_impl = getattr(config.vision_config, '_attn_implementation', None) or 'flash_attention_4'
-                if vision_attn_impl not in _vision_ok:
-                    logger.warning_once(
-                        f"MoonViT does not support attn_implementation={vision_attn_impl!r}; "
-                        "remapping to flash_attention_4/2 (or sdpa)."
-                    )
-                    vision_attn_impl = 'flash_attention_4'
-                if vision_attn_impl == 'flash_attention_4' and not is_flash_attn_4_available():
-                    logger.warning_once(
-                        "flash-attn-4 is not available for MoonViT inference; falling back to flash_attention_2/sdpa."
-                    )
-                    vision_attn_impl = 'flash_attention_2'
-                if vision_attn_impl == 'flash_attention_2' and not is_flash_attn_2_available():
-                    logger.warning_once(
-                        "flash_attn is not available for MoonViT inference; falling back to sdpa."
-                    )
-                    vision_attn_impl = 'sdpa'
+            vtype = config.vision_config.model_type
+            if vtype in ("moonvit", "moonvit_v2"):
+                vision_attn_impl = _resolve_moonvit_vision_attn(config.vision_config)
                 config.vision_config._attn_implementation = vision_attn_impl
-                self.vision_model = MoonVitPretrainedModel(config.vision_config)
+                if vtype == "moonvit":
+                    self.vision_model = MoonVitPretrainedModel(config.vision_config)
+                else:
+                    self.vision_model = MoonViTV2PretrainedModel(config.vision_config)
             else:
-                raise ValueError(f'Unsupported vision model type: {config.vision_config.model_type}. Only moonvit is supported.')
+                raise ValueError(
+                    f"Unsupported vision model type: {vtype}. "
+                    "Only moonvit / moonvit_v2 are supported."
+                )
 
         text_attn_impl = (
             getattr(config.text_config, '_attn_implementation', None)
@@ -295,9 +307,21 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
 
     
     def extract_feature(self, pixel_values, image_grid_hws):
-        vit_embeds = self.vision_model(pixel_values=pixel_values, grid_hws=image_grid_hws)
-
-        return vit_embeds
+        if self.config.vision_config.model_type == "moonvit_v2":
+            grid = image_grid_hws
+            if isinstance(grid, np.ndarray):
+                grid = torch.from_numpy(grid)
+            if not torch.is_tensor(grid):
+                grid = torch.as_tensor(grid)
+            grid = grid.to(device=pixel_values.device, dtype=torch.int32)
+            if grid.dim() == 1:
+                grid = grid.unsqueeze(0)
+            if grid.size(-1) == 2:
+                t = torch.ones(grid.size(0), 1, device=grid.device, dtype=grid.dtype)
+                grid = torch.cat([t, grid], dim=-1)
+            vit_embeds = self.vision_model(pixel_values=pixel_values, grid_thws=grid)
+            return [e.flatten(-2) if e.dim() == 3 else e for e in vit_embeds]
+        return self.vision_model(pixel_values=pixel_values, grid_hws=image_grid_hws)
 
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
