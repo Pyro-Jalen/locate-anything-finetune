@@ -1,0 +1,3 @@
+Locate all PCB Dimension Value pairs.
+For each pair, locate the Dimension Value in a box, then locate its Dimension Line;
+if it is a Leader Line, point to the related PCB footprint.

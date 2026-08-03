@@ -42,5 +42,10 @@ gradio_tmp/*
 
 unit_test*.*
 
-
+**/.qoder/
+**/data/
+**/results/
+**/study/
+Embodied.bak/*
+**/.venv/
 

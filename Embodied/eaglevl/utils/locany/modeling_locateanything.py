@@ -19,7 +19,7 @@ from peft import LoraConfig, get_peft_model
 
 from .configuration_locateanything import LocateAnythingConfig
 from .modeling_qwen2 import Qwen2ForCausalLM
-from .modeling_vit import MoonVitPretrainedModel
+from .modeling_vit import MoonVitPretrainedModel, is_flash_attn_4_available
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 from .mask_sdpa_utils import *
 from .mask_magi_utils import *
@@ -67,13 +67,13 @@ class LocateAnythingPreTrainedModel(PreTrainedModel):
 
     @classmethod
     def _autoset_attn_implementation(cls, config, *args, **kwargs):
-        if getattr(config, '_attn_implementation', None) == 'magi':
+        if getattr(config, '_attn_implementation', None) in ('magi', 'flash_attention_4'):
             return config
         return super()._autoset_attn_implementation(config, *args, **kwargs)
 
     def _check_and_adjust_attn_implementation(self, attn_implementation, is_init_check=False):
-        if attn_implementation == "magi":
-            return "magi"
+        if attn_implementation in ("magi", "flash_attention_4"):
+            return attn_implementation
         return super()._check_and_adjust_attn_implementation(attn_implementation, is_init_check)
     
     def _init_weights(self, module):
@@ -101,7 +101,21 @@ class LocateAnythingForConditionalGeneration(LocateAnythingPreTrainedModel, Gene
             self.vision_model = vision_model
         else:
             if config.vision_config.model_type == 'moonvit':
-                vision_attn_impl = getattr(config.vision_config, '_attn_implementation', None) or 'flash_attention_2'
+                # MoonViT supports flash_attention_4 / flash_attention_2 / sdpa / eager (not magi).
+                # from_pretrained(attn_implementation="magi") can leak "magi" into vision_config.
+                _vision_ok = {"flash_attention_4", "flash_attention_2", "sdpa", "eager"}
+                vision_attn_impl = getattr(config.vision_config, '_attn_implementation', None) or 'flash_attention_4'
+                if vision_attn_impl not in _vision_ok:
+                    logger.warning_once(
+                        f"MoonViT does not support attn_implementation={vision_attn_impl!r}; "
+                        "remapping to flash_attention_4/2 (or sdpa)."
+                    )
+                    vision_attn_impl = 'flash_attention_4'
+                if vision_attn_impl == 'flash_attention_4' and not is_flash_attn_4_available():
+                    logger.warning_once(
+                        "flash-attn-4 is not available for MoonViT inference; falling back to flash_attention_2/sdpa."
+                    )
+                    vision_attn_impl = 'flash_attention_2'
                 if vision_attn_impl == 'flash_attention_2' and not is_flash_attn_2_available():
                     logger.warning_once(
                         "flash_attn is not available for MoonViT inference; falling back to sdpa."

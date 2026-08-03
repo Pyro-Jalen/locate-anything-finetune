@@ -73,6 +73,16 @@ class ModelArguments:
     save_every_n_hours: int = field(
         default=4,
     )
+    milestone_interval: int = field(
+        default=2000,
+        metadata={
+            'help': (
+                'Copy checkpoints into output_dir/milestones every N steps for permanent '
+                'retention (independent of save_total_limit). Set 0 to disable. '
+                'N should be a multiple of --save_steps.'
+            )
+        },
+    )
     freeze_backbones: Optional[str] = field(
         default=None
     )

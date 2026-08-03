@@ -1,24 +1,22 @@
 #!/usr/bin/env bash
+# LocateAnything LoRA / visual-prompt SFT launcher (conda env: locateanything).
+# Usage:
+#   conda activate locateanything
+#   export HF_TOKEN=...
+#   export META_PATH=data/pcb_dimension/recipe.json
+#   bash shell/locate-anything-lora-visual-prompt.sh [NNODES] [OUTPUT_DIR]
 set -euo pipefail
 
-unset CONDA_SHLVL
-unset CONDA_EXE
-unset _CE_CONDA
-unset CONDA_PREFIX
-unset CONDA_PROMPT_MODIFIER
-unset CONDA_PYTHON_EXE
-unset CONDA_DEFAULT_ENV
-export PATH=$(echo "$PATH" | tr ':' '\n' | grep -v 'anaconda3' | paste -sd ':' -)
-pip install hf_xet
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
 
 export WANDB_PROJECT="${WANDB_PROJECT:-star-nemo}"
 export WANDB_RUN_ID="${WANDB_RUN_ID:-locany-lora-visual-prompt}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
-if [[ -z "${HF_TOKEN:-}" ]]; then
-  echo "Please set HF_TOKEN before launching training." >&2
-  exit 1
-fi
-export HF_TOKEN
+export HF_TOKEN="${HF_TOKEN:?Please set HF_TOKEN before launching training.}"
+export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
+export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.6}"
+export PATH="${CUDA_HOME}/bin:${PATH}"
 
 GPUS=${GPUS:-8}
 NNODES=${1:-1}
@@ -28,10 +26,7 @@ PORT=${PORT:-29500}
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 
 MODEL_PATH=${MODEL_PATH:-"nvidia/LocateAnything-3B"}
-if [[ -z "${META_PATH:-}" ]]; then
-  echo "Please set META_PATH to a training meta json. Set visual_prompt=true for datasets that should use visual prompts." >&2
-  exit 1
-fi
+META_PATH=${META_PATH:?Please set META_PATH to a training meta json. Set visual_prompt=true for datasets that should use visual prompts.}
 DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-"deepspeed_configs/zero_stage1_config.json"}
 
 PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-1}
@@ -53,9 +48,9 @@ FREEZE_BACKBONE=${FREEZE_BACKBONE:-True}
 FREEZE_MLP=${FREEZE_MLP:-False}
 
 mkdir -p "$OUTPUT_DIR"
-export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
 
 script_name=$(basename "${BASH_SOURCE[0]}")
+echo "Launching | python=$(command -v python) NODE_RANK=${NODE_RANK} GPUS=${GPUS} META_PATH=${META_PATH}"
 
 LAUNCHER=pytorch python -m torch.distributed.run \
   --nnodes="$NNODES" \
@@ -70,7 +65,7 @@ LAUNCHER=pytorch python -m torch.distributed.run \
   --meta_path "$META_PATH" \
   --overwrite_output_dir False \
   --block_size 6 \
-  --attn_implementation magi \
+  --attn_implementation "${ATTN_IMPLEMENTATION:-magi}" \
   --causal_attn False \
   --freeze_llm "$FREEZE_LLM" \
   --freeze_mlp "$FREEZE_MLP" \

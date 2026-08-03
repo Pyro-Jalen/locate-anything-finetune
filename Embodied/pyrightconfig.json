@@ -1,0 +1,15 @@
+{
+  "extraPaths": ["."],
+  "venvPath": "/workspace/.conda/envs",
+  "venv": "locateanything",
+  "pythonVersion": "3.10",
+  "exclude": [
+    ".venv",
+    "wandb",
+    "logs",
+    "results",
+    "**/__pycache__"
+  ],
+  "reportMissingImports": "warning",
+  "typeCheckingMode": "off"
+}

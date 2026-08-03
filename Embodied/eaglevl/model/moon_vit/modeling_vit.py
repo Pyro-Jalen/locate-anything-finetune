@@ -18,14 +18,25 @@ try:
 except ImportError:
     PytorchGELUTanh = lambda: nn.GELU(approximate='tanh')
 from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import is_flash_attn_2_available
+from transformers.utils import is_flash_attn_2_available, logging
 
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_varlen_func
 else:
     flash_attn_varlen_func = None
 
+try:
+    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+except Exception:
+    flash_attn4_varlen_func = None
+
 from transformers.configuration_utils import PretrainedConfig
+
+logger = logging.get_logger(__name__)
+
+
+def is_flash_attn_4_available() -> bool:
+    return flash_attn4_varlen_func is not None
 
 
 class MoonViTConfig(PretrainedConfig):
@@ -106,6 +117,54 @@ def multihead_attention(
     return attn_out
 
 
+def multihead_attention_fa4(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_cu_seqlens: Optional[torch.Tensor] = None,
+    k_cu_seqlens: Optional[torch.Tensor] = None,
+):
+    """Multi-head attention using FlashAttention-4 (flash_attn.cute)."""
+    if flash_attn4_varlen_func is None:
+        logger.warning_once(
+            "flash-attn-4 is not available for MoonViT; falling back to sdpa attention."
+        )
+        return sdpa_attention(
+            q,
+            k,
+            v,
+            q_cu_seqlens=q_cu_seqlens,
+            k_cu_seqlens=k_cu_seqlens,
+        )
+
+    assert q.dim() == k.dim() == v.dim() == 3, "q, k, v must have 3 dims"
+    assert q_cu_seqlens[-1] == q.shape[0], "q_cu_seqlens must sum to q.shape[0]"
+    assert (
+        k_cu_seqlens[-1] == k.shape[0] == v.shape[0]
+    ), "k_cu_seqlens must sum to k.shape[0]"
+    assert q.dtype in [
+        torch.bfloat16,
+        torch.float16,
+    ], f"unsupported dtype {q.dtype} for multihead attn"
+
+    # FA4 inserts optional `qv` before cu_seqlens; use keywords (FA2 positional order breaks).
+    max_seqlen_q = int((q_cu_seqlens[1:] - q_cu_seqlens[:-1]).max().item())
+    max_seqlen_k = int((k_cu_seqlens[1:] - k_cu_seqlens[:-1]).max().item())
+    attn_out = flash_attn4_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=q_cu_seqlens,
+        cu_seqlens_k=k_cu_seqlens,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        causal=False,
+    )
+    if isinstance(attn_out, tuple):
+        attn_out = attn_out[0]
+    return attn_out.flatten(start_dim=-2)
+
+
 def sdpa_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -170,6 +229,7 @@ def eager_attention(
 
 
 VL_VISION_ATTENTION_FUNCTIONS = {
+    "flash_attention_4": multihead_attention_fa4,
     "flash_attention_2": multihead_attention,
     "sdpa": sdpa_attention,
     "eager": eager_attention,
@@ -566,6 +626,18 @@ class MoonVitPretrainedModel(PreTrainedModel):
     _supports_flash_attn_2 = True
     _supports_sdpa = True
     supports_gradient_checkpointing = True
+
+    @classmethod
+    def _autoset_attn_implementation(cls, config, *args, **kwargs):
+        # HF does not know flash_attention_4; MoonViT dispatches it via VL_VISION_ATTENTION_FUNCTIONS.
+        if getattr(config, "_attn_implementation", None) == "flash_attention_4":
+            return config
+        return super()._autoset_attn_implementation(config, *args, **kwargs)
+
+    def _check_and_adjust_attn_implementation(self, attn_implementation, is_init_check=False):
+        if attn_implementation == "flash_attention_4":
+            return "flash_attention_4"
+        return super()._check_and_adjust_attn_implementation(attn_implementation, is_init_check)
 
     def __init__(self, config: MoonViTConfig, *inputs, **kwargs):
         super().__init__(config, *inputs, **kwargs)

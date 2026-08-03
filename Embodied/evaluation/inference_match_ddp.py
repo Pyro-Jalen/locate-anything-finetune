@@ -1,0 +1,982 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+"""Multi-GPU DDP inference for PCB dimension line↔value matching.
+
+LocateAnything tokens (orientation inferred from geometry at parse time):
+  ``<ref>dim_text:{text}</ref><box>value_bbox</box>``
+  ``<ref>dim_axis:{text}</ref><box>line_xyxy</box>``
+  or ``dim_target`` + point box for Leader / size_value.
+  Legacy ``dim_*:{horizontal|vertical|size_value}:{text}`` is still accepted.
+
+Parses into pad_detect-compatible match dicts and writes JSONL for::
+
+    pad_detect/eval/reward_new/evaluate_dimension_line_value_reward.py
+
+Input JSONL schema (``data/test/test.jsonl``)::
+
+    {"ID", "image_path", "dimension_label": [match, ...], "pad_hole_label": [...]}
+
+Legacy ``label`` is accepted as an alias of ``dimension_label``.
+
+Output JSONL schema::
+
+    {"ID", "image_path", "model_response", "model_result",
+     "dimension_label", "label"(=dimension_label for reward compat)}
+
+Coords stay in norm1000 [0, 1000], matching GT ``dimension_label``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+import re
+from collections import defaultdict, deque
+from pathlib import Path
+from typing import Any
+
+import torch
+import torch.distributed as dist
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
+from tqdm import tqdm
+from transformers import AutoModel, AutoProcessor
+
+from inference_compat import (
+    apply_chat_template,
+    build_generate_kwargs,
+    decode_generation_output,
+    prepare_generation_inputs,
+    process_vision_info,
+)
+
+os.environ.setdefault("NCCL_TIMEOUT", "7200")
+
+ORIENTATIONS = ("horizontal", "vertical", "size_value")
+DEFAULT_PROMPT_PATH = (
+    Path(__file__).resolve().parents[1] / "prompts" / "pcb_dimension_locate.txt"
+)
+
+REF_PATTERN = re.compile(r"<ref>([^<]+)</ref>((?:<box>.*?</box>)+)", re.DOTALL | re.IGNORECASE)
+POINT_PATTERN = re.compile(
+    r"<box>\s*<\s*([0-9]+(?:\.[0-9]+)?)\s*>\s*"
+    r"<\s*([0-9]+(?:\.[0-9]+)?)\s*>\s*</box>",
+    re.IGNORECASE,
+)
+BOX_PATTERN = re.compile(
+    r"<box>\s*<\s*([0-9]+(?:\.[0-9]+)?)\s*>\s*"
+    r"<\s*([0-9]+(?:\.[0-9]+)?)\s*>\s*"
+    r"<\s*([0-9]+(?:\.[0-9]+)?)\s*>\s*"
+    r"<\s*([0-9]+(?:\.[0-9]+)?)\s*>\s*</box>",
+    re.IGNORECASE,
+)
+# New: dim_text:C±0.05  |  Legacy: dim_text:horizontal:C±0.05
+REF_NAME_RE_LEGACY = re.compile(
+    r"^(dim_text|dim_axis|dim_target)\s*:\s*(horizontal|vertical|size_value)\s*:\s*(.+)$",
+    re.IGNORECASE,
+)
+REF_NAME_RE = re.compile(
+    r"^(dim_text|dim_axis|dim_target)\s*:\s*(.+)$",
+    re.IGNORECASE,
+)
+SPECIAL_TOKEN_RE = re.compile(r"<\|[^|>]+?\|>")
+
+
+def get_args():
+    parser = argparse.ArgumentParser(
+        description="DDP inference for PCB dimension match (LocateAnything → pad_detect schema)"
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default="/workspace/models/CheckPoints/size_line_value_match/locateanything-3b-full-pcb-magi",
+    )
+    parser.add_argument(
+        "--test_jsonl_path",
+        type=str,
+        default="/workspace/PROJECTS/github/Eagle/Embodied/data/test/test.jsonl",
+        help="test JSONL with ID / image_path / dimension_label (label alias ok)",
+    )
+    parser.add_argument(
+        "--image_root_dir",
+        type=str,
+        default="",
+        help="Optional root prepended to relative image_path. Empty = use image_path as-is.",
+    )
+    parser.add_argument(
+        "--save_path",
+        type=str,
+        default="/workspace/PROJECTS/pad_detect/results/size_line_value_match/"
+        "locateanything-3b-full-pcb-magi.jsonl",
+    )
+    parser.add_argument(
+        "--prompt_path",
+        type=str,
+        default=str(DEFAULT_PROMPT_PATH),
+        help="Task prompt used in training (pcb_dimension_locate.txt)",
+    )
+    parser.add_argument("--prompt", type=str, default=None, help="Override prompt text directly")
+    parser.add_argument("--max_new_tokens", type=int, default=8192)
+    parser.add_argument("--limit", type=int, default=None, help="Only evaluate first N samples")
+    parser.add_argument(
+        "--generation_mode",
+        type=str,
+        default="hybrid",
+        choices=["fast", "slow", "hybrid"],
+    )
+    parser.add_argument(
+        "--short_side_size",
+        type=int,
+        default=None,
+        help="Optional short-side resize before inference (coords stay norm1000; no remap).",
+    )
+    parser.add_argument(
+        "--print_sample",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print per-sample token stats + model output to terminal (default: on).",
+    )
+    parser.add_argument(
+        "--print_max_chars",
+        type=int,
+        default=0,
+        help="Truncate printed output to N chars (0 = print full output).",
+    )
+    parser.add_argument(
+        "--print_history",
+        action="store_true",
+        help="Also print MTP/AR step chunks from verbose generate history.",
+    )
+    parser.add_argument(
+        "--reparse_jsonl",
+        type=str,
+        default=None,
+        help="Reparse an existing prediction JSONL (model_response→model_result) "
+        "without loading the model. Writes back to --save_path (or in-place).",
+    )
+    # DDP
+    parser.add_argument("--world_size", type=int, default=1)
+    parser.add_argument("--num_nodes", type=int, default=1)
+    parser.add_argument("--node_rank", type=int, default=0)
+    parser.add_argument("--master_addr", type=str, default="127.0.0.1")
+    parser.add_argument("--master_port", type=str, default="29500")
+    parser.add_argument("--local_rank", type=int, default=-1)
+    return parser.parse_args()
+
+
+def setup_distributed():
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    else:
+        print("Not using distributed mode")
+        return 0, 1, 0
+
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        world_size=world_size,
+        rank=rank,
+        timeout=datetime.timedelta(hours=2),
+    )
+    dist.barrier()
+    return rank, world_size, local_rank
+
+
+def cleanup_distributed():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process():
+    if dist.is_initialized():
+        return dist.get_rank() == 0
+    return True
+
+
+def load_prompt(args) -> str:
+    if args.prompt:
+        return args.prompt.strip()
+    path = Path(args.prompt_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Prompt file not found: {path}")
+    return path.read_text(encoding="utf-8").strip()
+
+
+def load_test_data(test_jsonl_path: str, limit: int | None = None) -> list[dict]:
+    rows: list[dict] = []
+    with open(test_jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as e:
+                print(f"Warning: Failed to parse line: {e}")
+            if limit is not None and len(rows) >= limit:
+                break
+    return rows
+
+
+def clamp_norm(v: float) -> float:
+    return max(0.0, min(1000.0, float(v)))
+
+
+def parse_ref_name(name: str) -> tuple[str, str, str] | None:
+    """Parse ref name → (kind, orientation, value_text), else None.
+
+    orientation is set for legacy refs; empty for the new ``dim_*:{text}`` form
+    (H/V inferred later from line geometry; dim_target → size_value).
+    """
+    raw = name.strip()
+    m = REF_NAME_RE_LEGACY.match(raw)
+    if m:
+        kind = m.group(1).lower()
+        orient = m.group(2).lower()
+        text = m.group(3).strip()
+        return (kind, orient, text) if text else None
+    m = REF_NAME_RE.match(raw)
+    if not m:
+        return None
+    kind = m.group(1).lower()
+    text = m.group(2).strip()
+    if not text:
+        return None
+    # orientation left empty; H/V from line geometry, size_value from dim_target.
+    return kind, "", text
+
+
+def parse_locany_refs(text: str) -> list[dict[str, Any]]:
+    """Parse Scheme-B LocateAnything tokens into ordered atomic refs (norm1000).
+
+    Each item: {kind, orientation, value_text, coords, is_point}
+    """
+    results: list[dict[str, Any]] = []
+    for category, boxes_str in REF_PATTERN.findall(text or ""):
+        parsed = parse_ref_name(category)
+        if parsed is None:
+            continue
+        kind, orient, value_text = parsed
+        box_matches = BOX_PATTERN.findall(boxes_str)
+        point_matches = POINT_PATTERN.findall(boxes_str) if not box_matches else []
+
+        if kind == "dim_target":
+            if point_matches:
+                for match in point_matches:
+                    x, y = map(float, match)
+                    results.append(
+                        {
+                            "kind": kind,
+                            "orientation": orient,
+                            "value_text": value_text,
+                            "coords": [clamp_norm(x), clamp_norm(y)],
+                            "is_point": True,
+                        }
+                    )
+            elif box_matches:
+                for match in box_matches:
+                    x1, y1, x2, y2 = map(float, match)
+                    results.append(
+                        {
+                            "kind": kind,
+                            "orientation": orient,
+                            "value_text": value_text,
+                            "coords": [
+                                clamp_norm((x1 + x2) / 2.0),
+                                clamp_norm((y1 + y2) / 2.0),
+                            ],
+                            "is_point": True,
+                        }
+                    )
+            continue
+
+        if box_matches:
+            for match in box_matches:
+                x1, y1, x2, y2 = map(float, match)
+                if kind == "dim_axis":
+                    coords = [clamp_norm(x1), clamp_norm(y1), clamp_norm(x2), clamp_norm(y2)]
+                else:
+                    a, b, c, d = map(clamp_norm, (x1, y1, x2, y2))
+                    coords = [min(a, c), min(b, d), max(a, c), max(b, d)]
+                results.append(
+                    {
+                        "kind": kind,
+                        "orientation": orient,
+                        "value_text": value_text,
+                        "coords": coords,
+                        "is_point": False,
+                    }
+                )
+        elif point_matches and kind == "dim_axis":
+            for match in point_matches:
+                x, y = map(clamp_norm, map(float, match))
+                results.append(
+                    {
+                        "kind": kind,
+                        "orientation": orient,
+                        "value_text": value_text,
+                        "coords": [x, y, x, y],
+                        "is_point": False,
+                    }
+                )
+    return results
+
+
+def _pair_key(orient: str, text: str) -> str:
+    # Legacy refs keep orient in the key; new refs pair on value_text only.
+    return f"{orient}:{text}" if orient else text
+
+
+def refs_to_matches(refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pair dim_text with dim_axis/dim_target into pad_detect match dicts."""
+    matches: list[dict[str, Any]] = []
+    pending_text: dict[str, deque] = defaultdict(deque)
+    pending_geom: dict[str, deque] = defaultdict(deque)
+
+    def emit(orient: str, text: str, value_bbox: list[float], geom_kind: str, geom: list[float]):
+        item: dict[str, Any] = {
+            "value_bbox": value_bbox,
+            "value_text": text,
+            "orientation": orient or "horizontal",
+        }
+        if orient == "size_value" or geom_kind == "dim_target":
+            item["orientation"] = "size_value"
+            if len(geom) == 2:
+                item["target_point"] = geom
+            elif len(geom) == 4:
+                item["target_point"] = [
+                    (geom[0] + geom[2]) / 2.0,
+                    (geom[1] + geom[3]) / 2.0,
+                ]
+            else:
+                return
+        else:
+            if len(geom) != 4:
+                return
+            if orient not in ("horizontal", "vertical"):
+                dx = abs(geom[2] - geom[0])
+                dy = abs(geom[3] - geom[1])
+                item["orientation"] = "horizontal" if dx >= dy else "vertical"
+            item["line_xyxy"] = geom
+        matches.append(item)
+
+    for ref in refs:
+        kind = ref["kind"]
+        orient = ref["orientation"]
+        text = ref["value_text"]
+        coords = list(ref["coords"])
+        key = _pair_key(orient, text)
+
+        if kind == "dim_text":
+            # New-format dim_text has empty orient; allow matching dim_target via text key.
+            if pending_geom[key]:
+                gkind, gcoords = pending_geom[key].popleft()
+                emit(orient, text, coords, gkind, gcoords)
+            else:
+                pending_text[key].append((orient, coords))
+        elif kind in ("dim_axis", "dim_target"):
+            if pending_text[key]:
+                text_orient, vb = pending_text[key].popleft()
+                emit(orient or text_orient, text, vb, kind, coords)
+            else:
+                pending_geom[key].append((kind, coords))
+
+    return matches
+
+
+def parse_dimension_matches_from_locany(
+    text: str,
+    label: list[dict[str, Any]] | None = None,
+    **_kwargs,
+) -> list[dict[str, Any]]:
+    del label  # unused; kept for call-site compatibility
+    cleaned = SPECIAL_TOKEN_RE.sub("", text or "").strip()
+    return refs_to_matches(parse_locany_refs(cleaned))
+
+
+def reparse_prediction_jsonl(
+    input_path: str,
+    output_path: str | None = None,
+    **_kwargs,
+) -> dict[str, int]:
+    """Re-parse model_response → model_result for an existing pred JSONL."""
+    in_path = Path(input_path)
+    out_path = Path(output_path) if output_path else in_path
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    n_rows = n_pairs = n_empty = 0
+    rows_out: list[dict[str, Any]] = []
+    with in_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            n_rows += 1
+            response = row.get("model_response") or row.get("raw_response") or ""
+            model_result = parse_dimension_matches_from_locany(response)
+            row["model_result"] = model_result
+            if not model_result:
+                n_empty += 1
+            n_pairs += len(model_result)
+            rows_out.append(row)
+
+    with out_path.open("w", encoding="utf-8") as f:
+        for row in rows_out:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    stats = {"rows": n_rows, "pred_pairs": n_pairs, "empty_pred": n_empty}
+    print(
+        f"[reparse] {in_path} → {out_path} | "
+        f"rows={n_rows} pairs={n_pairs} empty={n_empty}"
+    )
+    return stats
+
+
+# Intermediate HF Trainer checkpoints often miss LocAny remote-code .py files.
+# Final output_dir has them; copy from parent (or repo utils) before from_pretrained.
+LOCANY_REMOTE_CODE_FILES = (
+    "configuration_locateanything.py",
+    "configuration_qwen2.py",
+    "modeling_locateanything.py",
+    "modeling_qwen2.py",
+    "modeling_vit.py",
+    "processing_locateanything.py",
+    "image_processing_locateanything.py",
+    "generate_utils.py",
+    "attn_mask_utils.py",
+    "mask_magi_utils.py",
+    "mask_sdpa_utils.py",
+)
+LOCANY_AUTO_MAP = {
+    "AutoConfig": "configuration_locateanything.LocateAnythingConfig",
+    "AutoModel": "modeling_locateanything.LocateAnythingForConditionalGeneration",
+    "AutoModelForCausalLM": "modeling_locateanything.LocateAnythingForConditionalGeneration",
+    "AutoImageProcessor": "image_processing_locateanything.LocateAnythingImageProcessor",
+    "AutoProcessor": "processing_locateanything.LocateAnythingProcessor",
+}
+
+
+# Always overwrite these from repo so mid-checkpoints pick up FA4 / magi loader fixes.
+LOCANY_FORCE_REFRESH_FROM_REPO = (
+    "modeling_vit.py",
+    "modeling_locateanything.py",
+)
+
+
+def ensure_locany_remote_code(model_path: str) -> str:
+    """Make a checkpoint-* dir loadable via trust_remote_code.
+
+    Trainer mid-checkpoints keep weights but often omit custom modeling/config
+    modules that only get copied into the final output_dir. If required files are
+    missing, copy them from the parent run dir (preferred) or Embodied utils.
+
+    Also force-refresh modeling_vit / modeling_locateanything from repo utils so
+    checkpoints saved with vision ``flash_attention_4`` can load under current HF.
+    """
+    import shutil
+
+    path = Path(model_path).resolve()
+    if not path.is_dir():
+        return model_path
+
+    repo_utils = Path(__file__).resolve().parents[1] / "eaglevl" / "utils" / "locany"
+    refreshed = []
+    if repo_utils.is_dir():
+        for name in LOCANY_FORCE_REFRESH_FROM_REPO:
+            src = repo_utils / name
+            if src.is_file():
+                shutil.copy2(src, path / name)
+                refreshed.append(name)
+
+    missing = [name for name in LOCANY_REMOTE_CODE_FILES if not (path / name).is_file()]
+    candidates = []
+    if path.name.startswith("checkpoint-") and path.parent.is_dir():
+        candidates.append(path.parent)
+    if repo_utils.is_dir():
+        candidates.append(repo_utils)
+
+    copied = []
+    still_missing = []
+    for name in missing:
+        src = next((c / name for c in candidates if (c / name).is_file()), None)
+        if src is None:
+            still_missing.append(name)
+            continue
+        shutil.copy2(src, path / name)
+        copied.append(name)
+
+    if still_missing:
+        raise FileNotFoundError(
+            f"{path} is missing LocAny remote-code files: {still_missing}. "
+            f"Point --model_path at the final output_dir, or ensure parent has these files."
+        )
+    if refreshed:
+        print(f"[ensure_locany_remote_code] Refreshed from repo into {path.name}: {', '.join(refreshed)}")
+    if copied:
+        print(f"[ensure_locany_remote_code] Copied into {path.name}: {', '.join(copied)}")
+
+    _ensure_locany_auto_map(path)
+    return str(path)
+
+
+def _patch_hf_attn_implementation_allowlist() -> None:
+    """Allow LocAny custom attn names that stock HF rejects (magi / flash_attention_4)."""
+    import transformers.modeling_utils as _hf_modeling_utils
+
+    if getattr(_hf_modeling_utils.PreTrainedModel, "_locany_attn_allowlist_patched", False):
+        return
+    _orig = _hf_modeling_utils.PreTrainedModel._check_and_adjust_attn_implementation
+
+    def _patched(self, attn_implementation, is_init_check=False):
+        if attn_implementation in ("magi", "flash_attention_4"):
+            return attn_implementation
+        return _orig(self, attn_implementation, is_init_check)
+
+    _hf_modeling_utils.PreTrainedModel._check_and_adjust_attn_implementation = _patched
+    _hf_modeling_utils.PreTrainedModel._locany_attn_allowlist_patched = True
+
+
+def _ensure_locany_auto_map(path: Path) -> None:
+    cfg_path = path / "config.json"
+    if not cfg_path.is_file():
+        return
+    try:
+        with cfg_path.open("r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return
+    auto_map = dict(cfg.get("auto_map") or {})
+    updated = False
+    for k, v in LOCANY_AUTO_MAP.items():
+        if auto_map.get(k) != v:
+            auto_map[k] = v
+            updated = True
+    if updated:
+        cfg["auto_map"] = auto_map
+        with cfg_path.open("w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        print(f"[ensure_locany_remote_code] Updated auto_map in {cfg_path}")
+
+
+def _count_output_tokens(processor, text: str) -> int:
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        return 0
+    try:
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        return len(ids)
+    except Exception:
+        return 0
+
+
+def _format_sample_log(
+    *,
+    rank: int,
+    sample_id: str,
+    gen: dict[str, Any],
+    model_result: list[dict[str, Any]],
+    label: list,
+    print_max_chars: int = 0,
+    print_history: bool = False,
+) -> str:
+    output = gen.get("text") or ""
+    n_gt = len(label) if isinstance(label, list) else 0
+    n_pred = len(model_result)
+    n_ref = output.count("<ref>")
+    n_box = output.count("<box>")
+    lines = [
+        "",
+        "=" * 72,
+        f"[Rank {rank}] ID={sample_id}",
+        (
+            f"  tokens={gen.get('num_tokens')}  steps={gen.get('num_steps')}  "
+            f"refs={n_ref}  boxes={n_box}  pred_pairs={n_pred}  gt_pairs={n_gt}"
+        ),
+    ]
+    if gen.get("gen_info"):
+        lines.append(f"  gen_info: {str(gen['gen_info']).strip()}")
+    if print_history and gen.get("history"):
+        lines.append("  history:")
+        for i, item in enumerate(gen["history"]):
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                mode, chunk = item[0], item[1]
+            else:
+                mode, chunk = "?", item
+            chunk_s = str(chunk).replace("\n", "\\n")
+            if len(chunk_s) > 120:
+                chunk_s = chunk_s[:117] + "..."
+            lines.append(f"    [{i:03d}] {mode}: {chunk_s}")
+    shown = output
+    if print_max_chars and print_max_chars > 0 and len(shown) > print_max_chars:
+        shown = shown[:print_max_chars] + f"...<truncated {len(output) - print_max_chars} chars>"
+    lines.append("  output:")
+    lines.append(shown)
+    lines.append("=" * 72)
+    return "\n".join(lines)
+
+
+class LocateAnythingMatchWorker:
+    def __init__(self, model_path: str, device: str = "cuda", generation_mode: str = "hybrid"):
+        self.device = device
+        self.generation_mode = generation_mode
+        _patch_hf_attn_implementation_allowlist()
+        model_path = ensure_locany_remote_code(model_path)
+        self.model = AutoModel.from_pretrained(
+            model_path, trust_remote_code=True, torch_dtype=torch.bfloat16
+        )
+        self.processor = AutoProcessor.from_pretrained(
+            model_path, trust_remote_code=True, use_fast=True
+        )
+        if hasattr(self.processor, "tokenizer"):
+            try:
+                self.processor.tokenizer.padding_side = "left"
+            except Exception:
+                pass
+        self.model = self.model.to(device)
+        self.model.eval()
+
+    def build_messages(self, image, prompt: str):
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        image,
+        prompt: str,
+        max_new_tokens: int = 8192,
+        verbose: bool = True,
+    ) -> dict[str, Any]:
+        """Generate and return text plus token/step stats for terminal logging."""
+        messages = self.build_messages(image, prompt)
+        text_list = [apply_chat_template(self.processor, messages)]
+        image_inputs, video_inputs = process_vision_info(self.processor, messages)
+        processor_inputs = self.processor(
+            text=text_list,
+            images=image_inputs,
+            videos=video_inputs,
+            return_tensors="pt",
+            padding=True,
+        )
+        prepared_inputs = prepare_generation_inputs(processor_inputs, self.device)
+        generate_kwargs = build_generate_kwargs(
+            prepared_inputs,
+            self.processor,
+            generation_mode=self.generation_mode,
+            max_new_tokens=max_new_tokens,
+            include_eos_token=True,
+        )
+        # LocAny generate(verbose=True) returns (text, sampling_history, stats_str)
+        generate_kwargs["verbose"] = bool(verbose)
+        raw_output = self.model.generate(**generate_kwargs)
+
+        history = None
+        gen_info = None
+        if isinstance(raw_output, tuple):
+            text = raw_output[0] if raw_output else ""
+            if len(raw_output) >= 2:
+                history = raw_output[1]
+            if len(raw_output) >= 3:
+                gen_info = raw_output[2]
+            if not isinstance(text, str):
+                text = decode_generation_output(
+                    text, prepared_inputs["input_ids"], self.processor
+                )
+        else:
+            text = decode_generation_output(
+                raw_output,
+                prepared_inputs["input_ids"],
+                self.processor,
+            )
+
+        num_tokens = _count_output_tokens(self.processor, text)
+        # Prefer token count parsed from model verbose stats when present.
+        if isinstance(gen_info, str):
+            m = re.search(r"num_tokens\s*=\s*(\d+)", gen_info)
+            if m:
+                num_tokens = int(m.group(1))
+        num_steps = len(history) if isinstance(history, list) else None
+        return {
+            "text": text if isinstance(text, str) else str(text),
+            "num_tokens": num_tokens,
+            "num_steps": num_steps,
+            "history": history,
+            "gen_info": gen_info,
+        }
+
+
+def _gt_fields_from_sample(sample: dict) -> dict[str, Any]:
+    """GT fields for prediction rows (reward keeps ``label`` alias)."""
+    dimension_label = sample.get("dimension_label") or sample.get("label") or []
+    return {
+        "dimension_label": dimension_label,
+        "pad_hole_label": sample.get("pad_hole_label") or [],
+        "label": dimension_label,
+    }
+
+
+class MatchDataset(Dataset):
+    def __init__(self, test_data: list[dict], image_root_dir: str):
+        self.test_data = test_data
+        self.image_root_dir = image_root_dir or ""
+
+    def __len__(self):
+        return len(self.test_data)
+
+    def __getitem__(self, idx):
+        entry = self.test_data[idx]
+        image_path = entry.get("image_path") or entry.get("image") or ""
+        sample_id = entry.get("ID") or entry.get("id") or Path(image_path).name
+        # Prefer dimension_label; fall back to legacy label.
+        dimension_label = entry.get("dimension_label")
+        if dimension_label is None:
+            dimension_label = entry.get("label") or []
+        pad_hole_label = entry.get("pad_hole_label") or []
+        if self.image_root_dir and image_path and not os.path.isabs(image_path):
+            full_image_path = os.path.join(self.image_root_dir, image_path)
+        else:
+            full_image_path = image_path
+        return {
+            "ID": sample_id,
+            "image_path": image_path,
+            "full_image_path": full_image_path,
+            "dimension_label": dimension_label,
+            "pad_hole_label": pad_hole_label,
+            # Alias for older call sites / reward --gt-key label
+            "label": dimension_label,
+            "idx": idx,
+        }
+
+
+def resize_image_short_side(image: Image.Image, short_side_size: int):
+    w, h = image.size
+    if w <= h:
+        new_w = short_side_size
+        scale = new_w / w
+        new_h = int(h * scale)
+    else:
+        new_h = short_side_size
+        scale = new_h / h
+        new_w = int(w * scale)
+    return image.resize((new_w, new_h), Image.BILINEAR), scale
+
+
+def main():
+    args = get_args()
+
+    # Offline reparse path: no model / no DDP needed.
+    if args.reparse_jsonl:
+        out = args.save_path or args.reparse_jsonl
+        reparse_prediction_jsonl(args.reparse_jsonl, out)
+        return
+
+    rank, world_size, local_rank = setup_distributed()
+    device = f"cuda:{local_rank}" if local_rank >= 0 else "cuda"
+    prompt = load_prompt(args)
+
+    if is_main_process():
+        print("=== PCB Dimension Match DDP Inference ===")
+        print(f"World Size: {world_size}")
+        print(f"Model Path: {args.model_path}")
+        print(f"Test JSONL: {args.test_jsonl_path}")
+        print(f"Save Path: {args.save_path}")
+        print(f"Generation Mode: {args.generation_mode}")
+        print(f"Prompt:\n{prompt}\n")
+
+    save_dir = os.path.dirname(args.save_path)
+    if is_main_process() and save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    if dist.is_initialized():
+        dist.barrier()
+
+    worker = LocateAnythingMatchWorker(
+        args.model_path, device=device, generation_mode=args.generation_mode
+    )
+
+    test_data = load_test_data(args.test_jsonl_path, limit=args.limit)
+    if is_main_process():
+        print(f"Loaded {len(test_data)} test entries")
+
+    dataset = MatchDataset(test_data, args.image_root_dir)
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False,
+        drop_last=False,
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=1,
+        sampler=sampler,
+        num_workers=0,
+        collate_fn=lambda x: x[0],
+    )
+
+    local_predictions: list[dict] = []
+    iterator = tqdm(dataloader, desc=f"Rank {rank}", disable=not is_main_process())
+
+    for sample in iterator:
+        full_image_path = sample["full_image_path"]
+        if not full_image_path or not os.path.exists(full_image_path):
+            print(f"[Rank {rank}] Warning: Image not found: {full_image_path}")
+            local_predictions.append(
+                {
+                    "ID": sample["ID"],
+                    "image_path": sample["image_path"],
+                    "model_response": "",
+                    "model_result": [],
+                    **_gt_fields_from_sample(sample),
+                    "error": f"image_not_found: {full_image_path}",
+                }
+            )
+            continue
+
+        try:
+            image = Image.open(full_image_path).convert("RGB")
+        except Exception as e:
+            print(f"[Rank {rank}] Error loading image {full_image_path}: {e}")
+            local_predictions.append(
+                {
+                    "ID": sample["ID"],
+                    "image_path": sample["image_path"],
+                    "model_response": "",
+                    "model_result": [],
+                    **_gt_fields_from_sample(sample),
+                    "error": str(e),
+                }
+            )
+            continue
+
+        if args.short_side_size is not None:
+            image, _ = resize_image_short_side(image, args.short_side_size)
+
+        try:
+            gen = worker.generate(
+                image,
+                prompt,
+                max_new_tokens=args.max_new_tokens,
+                verbose=True,
+            )
+            output = gen["text"]
+        except Exception as e:
+            print(f"[Rank {rank}] Generate failed for {sample['ID']}: {e}")
+            local_predictions.append(
+                {
+                    "ID": sample["ID"],
+                    "image_path": sample["image_path"],
+                    "model_response": "",
+                    "model_result": [],
+                    **_gt_fields_from_sample(sample),
+                    "error": f"generate_failed: {e}",
+                }
+            )
+            continue
+
+        try:
+            model_result = parse_dimension_matches_from_locany(output)
+        except Exception as e:
+            print(f"[Rank {rank}] Parse failed for {sample['ID']}: {e}")
+            model_result = []
+
+        if args.print_sample:
+            log_block = _format_sample_log(
+                rank=rank,
+                sample_id=sample["ID"],
+                gen=gen,
+                model_result=model_result,
+                label=sample["dimension_label"],
+                print_max_chars=args.print_max_chars,
+                print_history=args.print_history,
+            )
+            # Avoid breaking tqdm progress bar layout.
+            try:
+                iterator.write(log_block)
+            except Exception:
+                print(log_block, flush=True)
+
+        local_predictions.append(
+            {
+                "ID": sample["ID"],
+                "image_path": sample["image_path"],
+                "model_response": output if isinstance(output, str) else str(output),
+                "model_result": model_result,
+                **_gt_fields_from_sample(sample),
+                "num_tokens": gen.get("num_tokens"),
+                "num_steps": gen.get("num_steps"),
+            }
+        )
+
+    print(f"[Rank {rank}] Finished {len(local_predictions)} samples")
+
+    base_name = os.path.basename(args.save_path)
+    name_without_ext = os.path.splitext(base_name)[0]
+    ext = os.path.splitext(base_name)[1] or ".jsonl"
+    rank_save_path = os.path.join(save_dir or ".", f"{name_without_ext}_rank{rank}{ext}")
+    with open(rank_save_path, "w", encoding="utf-8") as f:
+        for pred in local_predictions:
+            f.write(json.dumps(pred, ensure_ascii=False) + "\n")
+    print(f"[Rank {rank}] Saved to {rank_save_path}")
+
+    if dist.is_initialized():
+        dist.barrier()
+
+    if is_main_process():
+        all_predictions: list[dict] = []
+        for r in range(world_size):
+            r_path = os.path.join(save_dir or ".", f"{name_without_ext}_rank{r}{ext}")
+            if not os.path.exists(r_path):
+                continue
+            with open(r_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        all_predictions.append(json.loads(line))
+            os.remove(r_path)
+
+        # Stable order by original test list if possible
+        id_order = {
+            (row.get("ID") or row.get("id") or Path(row.get("image_path", "")).name): i
+            for i, row in enumerate(test_data)
+        }
+        all_predictions.sort(key=lambda p: id_order.get(p.get("ID"), 10**9))
+
+        with open(args.save_path, "w", encoding="utf-8") as f:
+            for pred in all_predictions:
+                f.write(json.dumps(pred, ensure_ascii=False) + "\n")
+        print(f"Saved {len(all_predictions)} predictions to {args.save_path}")
+
+        n_empty = sum(1 for p in all_predictions if not p.get("model_result"))
+        n_pairs = sum(len(p.get("model_result") or []) for p in all_predictions)
+        n_gt = sum(
+            len(p.get("dimension_label") or p.get("label") or [])
+            for p in all_predictions
+        )
+        print(f"Summary: samples={len(all_predictions)} empty_pred={n_empty} "
+              f"pred_pairs={n_pairs} gt_pairs={n_gt}")
+
+    cleanup_distributed()
+
+
+if __name__ == "__main__":
+    main()

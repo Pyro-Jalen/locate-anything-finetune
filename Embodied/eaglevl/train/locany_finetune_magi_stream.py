@@ -90,8 +90,9 @@ import transformers.modeling_utils as _hf_modeling_utils
 _orig_check_and_adjust = _hf_modeling_utils.PreTrainedModel._check_and_adjust_attn_implementation
 
 def _patched_check_and_adjust(self, attn_implementation, is_init_check=False):
-    if attn_implementation == "magi":
-        return "magi"
+    # magi: LLM packing; flash_attention_4: MoonViT FA4 (not in stock HF allowlist).
+    if attn_implementation in ("magi", "flash_attention_4"):
+        return attn_implementation
     return _orig_check_and_adjust(self, attn_implementation, is_init_check=is_init_check)
 
 _hf_modeling_utils.PreTrainedModel._check_and_adjust_attn_implementation = _patched_check_and_adjust
@@ -1334,9 +1335,21 @@ def main():
         config._attn_implementation_autoset = False
         config.text_config._attn_implementation = model_args.attn_implementation
         config.text_config._attn_implementation_autoset = False
-        config.vision_config._attn_implementation = 'flash_attention_2'
+        # Vision tower supports flash_attention_4 / flash_attention_2 / sdpa / eager (not magi).
+        # Prefer FA4, then FA2, else sdpa. Never pass LLM "magi" to MoonViT.
+        from transformers.utils import is_flash_attn_2_available as _fa2_ok
+        from eaglevl.model.moon_vit.modeling_vit import is_flash_attn_4_available as _fa4_ok
+        if model_args.attn_implementation == 'sdpa':
+            vision_attn = 'sdpa'
+        elif _fa4_ok():
+            vision_attn = 'flash_attention_4'
+        elif _fa2_ok():
+            vision_attn = 'flash_attention_2'
+        else:
+            vision_attn = 'sdpa'
+        config.vision_config._attn_implementation = vision_attn
         config.vision_config._attn_implementation_autoset = False
-        logger.info(f'Text attn: {model_args.attn_implementation}, Vision attn: flash_attention_2')
+        logger.info(f'Text attn: {model_args.attn_implementation}, Vision attn: {vision_attn}')
 
         config.image_token_index = image_token_index
         config.text_config.block_size = int(model_args.block_size)
@@ -1351,10 +1364,12 @@ def main():
         config.ref_end_token_id = ref_end_token_id
         config.none_token_id = none_token_id
 
+        # Do not pass attn_implementation= here: HF propagates it to vision_config and
+        # would overwrite MoonViT with "magi". Text/vision are already set on config.
         model = LocateAnythingForConditionalGeneration.from_pretrained(
-            model_args.model_name_or_path, 
-            torch_dtype=torch.bfloat16, config=config, 
-            attn_implementation=model_args.attn_implementation
+            model_args.model_name_or_path,
+            torch_dtype=torch.bfloat16,
+            config=config,
         )
             
         model.text_mask_token_id = text_mask_token_id
@@ -1379,7 +1394,15 @@ def main():
 
         if vision_config.model_type == 'moonvit':
             logger.info('Loading MoonVit...')
-            vision_config._attn_implementation = 'flash_attention_2'
+            from eaglevl.model.moon_vit.modeling_vit import is_flash_attn_4_available as _fa4_ok
+            from transformers.utils import is_flash_attn_2_available as _fa2_ok
+            if _fa4_ok():
+                vision_config._attn_implementation = 'flash_attention_4'
+            elif _fa2_ok():
+                vision_config._attn_implementation = 'flash_attention_2'
+            else:
+                vision_config._attn_implementation = 'sdpa'
+            logger.info(f'Vision attn (scratch path): {vision_config._attn_implementation}')
             vision_model = MoonVitPretrainedModel.from_pretrained(
                 model_args.vision_path, torch_dtype=torch.bfloat16, config=vision_config)
         else:
@@ -1524,7 +1547,12 @@ def main():
             initial_interval_hours=model_args.save_every_n_hours, save_interval_minutes=5))
     my_callbacks.append(MemoryLoggerCallback())
     my_callbacks.append(DataloaderStateCallback(train_dataset))
-    my_callbacks.append(MilestoneCheckpointCallback(milestone_interval=2000))
+    if model_args.milestone_interval > 0:
+        my_callbacks.append(
+            MilestoneCheckpointCallback(milestone_interval=model_args.milestone_interval))
+        logger.info(f'MilestoneCheckpoint enabled: interval={model_args.milestone_interval}')
+    else:
+        logger.info('MilestoneCheckpoint disabled (milestone_interval=0)')
     
     CustomTrainer = StreamPackingMTPTrainer
 
