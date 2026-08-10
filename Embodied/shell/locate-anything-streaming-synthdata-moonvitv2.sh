@@ -27,7 +27,7 @@ cd "$ROOT"
 # =============================================================================
 export WANDB_API_KEY="${WANDB_API_KEY:-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}"
 export WANDB_PROJECT="${WANDB_PROJECT:-pad_dimension_and_pad_hole}"
-export WANDB_NAME="${WANDB_NAME:-locateanything-3b-moonvitv2-synthdata-v4-mix}"
+export WANDB_NAME="${WANDB_NAME:-locateanything-3b-moonvitv2-synthdatav4mix-xycorneroder}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
 
 # =============================================================================

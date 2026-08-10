@@ -6,30 +6,36 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-"""Multi-GPU DDP inference for PCB dimension line↔value matching.
+"""Multi-GPU DDP inference for PCB LocAny tasks.
 
-LocateAnything tokens (orientation inferred from geometry at parse time):
-  ``<ref>dim_text:{text}</ref><box>value_bbox</box>``
-  ``<ref>dim_axis:{text}</ref><box>line_xyxy</box>``
-  or ``dim_target`` + point box for Leader / size_value.
-  Legacy ``dim_*:{horizontal|vertical|size_value}:{text}`` is still accepted.
+Tasks (``--task``)::
+  - dimension: line↔value matching
+  - pad_hole: SMD Pad / Locating Hole detection
+  - both: run both prompts per image
 
-Parses into pad_detect-compatible match dicts and writes JSONL for::
+Label / prediction formats follow ``Embodied/data/data-detect-rule.md``::
 
-    pad_detect/eval/reward_new/evaluate_dimension_line_value_reward.py
+  Pad/Hole (class-major, one ref + many boxes)::
+    <ref>SMD Pad</ref><box>...</box><box>...</box>
+    <ref>Locating Hole</ref><box>...</box>...
 
-Input JSONL schema (``data/test/test.jsonl``)::
+  Dimension (adjacent value pairs)::
+    <ref>dim_text:VALUE</ref><box>xyxy</box>
+    <ref>dim_axis:VALUE</ref><box>xyxy</box>
+    or dim_text → dim_target (2-point box)
 
-    {"ID", "image_path", "dimension_label": [match, ...], "pad_hole_label": [...]}
+Input JSONL (aligned with ``test_dimension_pad_hole.jsonl``)::
 
-Legacy ``label`` is accepted as an alias of ``dimension_label``.
+    {"ID", "image_path", "dimension_label": [...], "pad_hole_label": [...]}
 
-Output JSONL schema::
+Output JSONL keeps the same GT fields and adds predictions::
 
-    {"ID", "image_path", "model_response", "model_result",
-     "dimension_label", "label"(=dimension_label for reward compat)}
+    {"ID", "image_path", "dimension_label", "pad_hole_label",
+     "model_response", "model_result",           # dimension
+     "pad_hole_response", "pad_hole_result",     # pad/hole [{type,bbox}]
+     "label"(=dimension_label, reward compat)}
 
-Coords stay in norm1000 [0, 1000], matching GT ``dimension_label``.
+Coords stay in norm1000 [0, 1000].
 """
 
 from __future__ import annotations
@@ -39,7 +45,6 @@ import datetime
 import json
 import os
 import re
-from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any
 
@@ -60,39 +65,46 @@ from inference_compat import (
 
 os.environ.setdefault("NCCL_TIMEOUT", "7200")
 
-ORIENTATIONS = ("horizontal", "vertical", "size_value")
 DEFAULT_PROMPT_PATH = (
     Path(__file__).resolve().parents[1] / "prompts" / "pcb_dimension_locate.txt"
 )
+DEFAULT_PAD_HOLE_PROMPT_PATH = (
+    Path(__file__).resolve().parents[1] / "prompts" / "pcb_smd_hole_locate.txt"
+)
+TASK_CHOICES = ("dimension", "pad_hole", "both")
 
-REF_PATTERN = re.compile(r"<ref>([^<]+)</ref>((?:<box>.*?</box>)+)", re.DOTALL | re.IGNORECASE)
-POINT_PATTERN = re.compile(
-    r"<box>\s*<\s*([0-9]+(?:\.[0-9]+)?)\s*>\s*"
-    r"<\s*([0-9]+(?:\.[0-9]+)?)\s*>\s*</box>",
-    re.IGNORECASE,
+# Canonical LocAny chunk: one <ref> then one or more <box> (see data-detect-rule.md).
+REF_CHUNK_RE = re.compile(
+    r"<ref>\s*([^<]+?)\s*</ref>\s*((?:<box>.*?</box>\s*)+)",
+    re.DOTALL | re.IGNORECASE,
 )
-BOX_PATTERN = re.compile(
-    r"<box>\s*<\s*([0-9]+(?:\.[0-9]+)?)\s*>\s*"
-    r"<\s*([0-9]+(?:\.[0-9]+)?)\s*>\s*"
-    r"<\s*([0-9]+(?:\.[0-9]+)?)\s*>\s*"
-    r"<\s*([0-9]+(?:\.[0-9]+)?)\s*>\s*</box>",
-    re.IGNORECASE,
-)
-# New: dim_text:C±0.05  |  Legacy: dim_text:horizontal:C±0.05
-REF_NAME_RE_LEGACY = re.compile(
-    r"^(dim_text|dim_axis|dim_target)\s*:\s*(horizontal|vertical|size_value)\s*:\s*(.+)$",
-    re.IGNORECASE,
-)
-REF_NAME_RE = re.compile(
+BOX_TAG_RE = re.compile(r"<box>(.*?)</box>", re.DOTALL | re.IGNORECASE)
+COORD_RE = re.compile(r"<\s*([0-9]+(?:\.[0-9]+)?)\s*>")
+DIM_REF_RE = re.compile(
     r"^(dim_text|dim_axis|dim_target)\s*:\s*(.+)$",
     re.IGNORECASE,
 )
 SPECIAL_TOKEN_RE = re.compile(r"<\|[^|>]+?\|>")
+PAD_HOLE_REF_TO_TYPE = {
+    "smd pad": "pad",
+    "pad": "pad",
+    "rect": "pad",
+    "locating hole": "hole",
+    "hole": "hole",
+    "circle": "hole",
+}
 
 
 def get_args():
     parser = argparse.ArgumentParser(
         description="DDP inference for PCB dimension match (LocateAnything → pad_detect schema)"
+    )
+    parser.add_argument(
+        "--task",
+        type=str,
+        default="dimension",
+        choices=list(TASK_CHOICES),
+        help="dimension | pad_hole | both",
     )
     parser.add_argument(
         "--model_path",
@@ -103,7 +115,7 @@ def get_args():
         "--test_jsonl_path",
         type=str,
         default="/workspace/PROJECTS/github/Eagle/Embodied/data/test/test.jsonl",
-        help="test JSONL with ID / image_path / dimension_label (label alias ok)",
+        help="test JSONL with ID / image_path / dimension_label / pad_hole_label",
     )
     parser.add_argument(
         "--image_root_dir",
@@ -121,9 +133,21 @@ def get_args():
         "--prompt_path",
         type=str,
         default=str(DEFAULT_PROMPT_PATH),
-        help="Task prompt used in training (pcb_dimension_locate.txt)",
+        help="Dimension task prompt (pcb_dimension_locate.txt)",
     )
-    parser.add_argument("--prompt", type=str, default=None, help="Override prompt text directly")
+    parser.add_argument(
+        "--pad_hole_prompt_path",
+        type=str,
+        default=str(DEFAULT_PAD_HOLE_PROMPT_PATH),
+        help="Pad/hole task prompt (pcb_smd_hole_locate.txt)",
+    )
+    parser.add_argument("--prompt", type=str, default=None, help="Override dimension prompt text")
+    parser.add_argument(
+        "--pad_hole_prompt",
+        type=str,
+        default=None,
+        help="Override pad/hole prompt text",
+    )
     parser.add_argument("--max_new_tokens", type=int, default=8192)
     parser.add_argument("--limit", type=int, default=None, help="Only evaluate first N samples")
     parser.add_argument(
@@ -204,13 +228,23 @@ def is_main_process():
     return True
 
 
-def load_prompt(args) -> str:
-    if args.prompt:
-        return args.prompt.strip()
-    path = Path(args.prompt_path)
-    if not path.is_file():
-        raise FileNotFoundError(f"Prompt file not found: {path}")
-    return path.read_text(encoding="utf-8").strip()
+def load_prompt_text(override: str | None, path: str | Path) -> str:
+    if override:
+        return override.strip()
+    p = Path(path)
+    if not p.is_file():
+        raise FileNotFoundError(f"Prompt file not found: {p}")
+    return p.read_text(encoding="utf-8").strip()
+
+
+def load_prompts(args) -> dict[str, str]:
+    """Return prompts needed for ``args.task``."""
+    out: dict[str, str] = {}
+    if args.task in ("dimension", "both"):
+        out["dimension"] = load_prompt_text(args.prompt, args.prompt_path)
+    if args.task in ("pad_hole", "both"):
+        out["pad_hole"] = load_prompt_text(args.pad_hole_prompt, args.pad_hole_prompt_path)
+    return out
 
 
 def load_test_data(test_jsonl_path: str, limit: int | None = None) -> list[dict]:
@@ -233,165 +267,157 @@ def clamp_norm(v: float) -> float:
     return max(0.0, min(1000.0, float(v)))
 
 
-def parse_ref_name(name: str) -> tuple[str, str, str] | None:
-    """Parse ref name → (kind, orientation, value_text), else None.
+def _parse_box_coords(box_inner: str) -> list[float] | None:
+    """Parse LocAny box body into 2 (point) or 4 (xyxy) floats."""
+    nums = [float(x) for x in COORD_RE.findall(box_inner or "")]
+    if len(nums) in (2, 4):
+        return nums
+    return None
 
-    orientation is set for legacy refs; empty for the new ``dim_*:{text}`` form
-    (H/V inferred later from line geometry; dim_target → size_value).
-    """
-    raw = name.strip()
-    m = REF_NAME_RE_LEGACY.match(raw)
-    if m:
-        kind = m.group(1).lower()
-        orient = m.group(2).lower()
-        text = m.group(3).strip()
-        return (kind, orient, text) if text else None
-    m = REF_NAME_RE.match(raw)
+
+def iter_ref_chunks(text: str) -> list[tuple[str, list[list[float]]]]:
+    """Yield ``(ref_name, [coords, ...])`` for each ``<ref>…</ref><box>…</box>+`` chunk."""
+    chunks: list[tuple[str, list[list[float]]]] = []
+    for ref_raw, boxes_str in REF_CHUNK_RE.findall(text or ""):
+        coords_list: list[list[float]] = []
+        for box_inner in BOX_TAG_RE.findall(boxes_str):
+            coords = _parse_box_coords(box_inner)
+            if coords is not None:
+                coords_list.append(coords)
+        if coords_list:
+            chunks.append((ref_raw.strip(), coords_list))
+    return chunks
+
+
+def _norm_xyxy(coords: list[float]) -> list[float]:
+    x1, y1, x2, y2 = (clamp_norm(v) for v in coords)
+    return [min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)]
+
+
+def _norm_point(coords: list[float]) -> list[float]:
+    if len(coords) == 2:
+        return [clamp_norm(coords[0]), clamp_norm(coords[1])]
+    x1, y1, x2, y2 = (clamp_norm(v) for v in coords[:4])
+    return [(x1 + x2) / 2.0, (y1 + y2) / 2.0]
+
+
+def parse_dim_ref_name(name: str) -> tuple[str, str] | None:
+    """Parse ``dim_text|dim_axis|dim_target:VALUE`` → ``(kind, value_text)``."""
+    m = DIM_REF_RE.match(name.strip())
     if not m:
         return None
     kind = m.group(1).lower()
-    text = m.group(2).strip()
-    if not text:
-        return None
-    # orientation left empty; H/V from line geometry, size_value from dim_target.
-    return kind, "", text
+    value = m.group(2).strip()
+    return (kind, value) if value else None
 
 
-def parse_locany_refs(text: str) -> list[dict[str, Any]]:
-    """Parse Scheme-B LocateAnything tokens into ordered atomic refs (norm1000).
+def parse_locany_dim_atoms(text: str) -> list[dict[str, Any]]:
+    """Flatten dimension chunks into ordered atoms (one box each).
 
-    Each item: {kind, orientation, value_text, coords, is_point}
+    Each atom: ``{kind, value_text, coords, is_point}``.
+    Canonical labels use one box per ref; multiple boxes under one ref are
+    expanded in order (same kind/value).
     """
-    results: list[dict[str, Any]] = []
-    for category, boxes_str in REF_PATTERN.findall(text or ""):
-        parsed = parse_ref_name(category)
+    atoms: list[dict[str, Any]] = []
+    for ref_name, coords_list in iter_ref_chunks(text):
+        parsed = parse_dim_ref_name(ref_name)
         if parsed is None:
             continue
-        kind, orient, value_text = parsed
-        box_matches = BOX_PATTERN.findall(boxes_str)
-        point_matches = POINT_PATTERN.findall(boxes_str) if not box_matches else []
-
-        if kind == "dim_target":
-            if point_matches:
-                for match in point_matches:
-                    x, y = map(float, match)
-                    results.append(
-                        {
-                            "kind": kind,
-                            "orientation": orient,
-                            "value_text": value_text,
-                            "coords": [clamp_norm(x), clamp_norm(y)],
-                            "is_point": True,
-                        }
-                    )
-            elif box_matches:
-                for match in box_matches:
-                    x1, y1, x2, y2 = map(float, match)
-                    results.append(
-                        {
-                            "kind": kind,
-                            "orientation": orient,
-                            "value_text": value_text,
-                            "coords": [
-                                clamp_norm((x1 + x2) / 2.0),
-                                clamp_norm((y1 + y2) / 2.0),
-                            ],
-                            "is_point": True,
-                        }
-                    )
-            continue
-
-        if box_matches:
-            for match in box_matches:
-                x1, y1, x2, y2 = map(float, match)
-                if kind == "dim_axis":
-                    coords = [clamp_norm(x1), clamp_norm(y1), clamp_norm(x2), clamp_norm(y2)]
-                else:
-                    a, b, c, d = map(clamp_norm, (x1, y1, x2, y2))
-                    coords = [min(a, c), min(b, d), max(a, c), max(b, d)]
-                results.append(
+        kind, value_text = parsed
+        for coords in coords_list:
+            if kind == "dim_target":
+                atoms.append(
                     {
                         "kind": kind,
-                        "orientation": orient,
                         "value_text": value_text,
-                        "coords": coords,
+                        "coords": _norm_point(coords),
+                        "is_point": True,
+                    }
+                )
+            elif len(coords) == 4:
+                # Keep axis endpoints as-is (may be a degenerate line).
+                if kind == "dim_axis":
+                    xyxy = [clamp_norm(v) for v in coords]
+                else:
+                    xyxy = _norm_xyxy(coords)
+                atoms.append(
+                    {
+                        "kind": kind,
+                        "value_text": value_text,
+                        "coords": xyxy,
                         "is_point": False,
                     }
                 )
-        elif point_matches and kind == "dim_axis":
-            for match in point_matches:
-                x, y = map(clamp_norm, map(float, match))
-                results.append(
+            elif len(coords) == 2 and kind == "dim_axis":
+                x, y = _norm_point(coords)
+                atoms.append(
                     {
                         "kind": kind,
-                        "orientation": orient,
                         "value_text": value_text,
                         "coords": [x, y, x, y],
                         "is_point": False,
                     }
                 )
-    return results
+    return atoms
 
 
-def _pair_key(orient: str, text: str) -> str:
-    # Legacy refs keep orient in the key; new refs pair on value_text only.
-    return f"{orient}:{text}" if orient else text
-
-
-def refs_to_matches(refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Pair dim_text with dim_axis/dim_target into pad_detect match dicts."""
-    matches: list[dict[str, Any]] = []
-    pending_text: dict[str, deque] = defaultdict(deque)
-    pending_geom: dict[str, deque] = defaultdict(deque)
-
-    def emit(orient: str, text: str, value_bbox: list[float], geom_kind: str, geom: list[float]):
-        item: dict[str, Any] = {
-            "value_bbox": value_bbox,
-            "value_text": text,
-            "orientation": orient or "horizontal",
-        }
-        if orient == "size_value" or geom_kind == "dim_target":
-            item["orientation"] = "size_value"
-            if len(geom) == 2:
-                item["target_point"] = geom
-            elif len(geom) == 4:
-                item["target_point"] = [
-                    (geom[0] + geom[2]) / 2.0,
-                    (geom[1] + geom[3]) / 2.0,
-                ]
-            else:
-                return
+def _emit_dimension_match(
+    value_text: str,
+    value_bbox: list[float],
+    geom_kind: str,
+    geom: list[float],
+) -> dict[str, Any] | None:
+    item: dict[str, Any] = {
+        "value_bbox": value_bbox,
+        "value_text": value_text,
+        "orientation": "horizontal",
+    }
+    if geom_kind == "dim_target":
+        item["orientation"] = "size_value"
+        if len(geom) == 2:
+            item["target_point"] = geom
+        elif len(geom) == 4:
+            item["target_point"] = _norm_point(geom)
         else:
-            if len(geom) != 4:
-                return
-            if orient not in ("horizontal", "vertical"):
-                dx = abs(geom[2] - geom[0])
-                dy = abs(geom[3] - geom[1])
-                item["orientation"] = "horizontal" if dx >= dy else "vertical"
-            item["line_xyxy"] = geom
-        matches.append(item)
+            return None
+    else:
+        if len(geom) != 4:
+            return None
+        dx = abs(geom[2] - geom[0])
+        dy = abs(geom[3] - geom[1])
+        item["orientation"] = "horizontal" if dx >= dy else "vertical"
+        item["line_xyxy"] = geom
+    return item
 
-    for ref in refs:
-        kind = ref["kind"]
-        orient = ref["orientation"]
-        text = ref["value_text"]
-        coords = list(ref["coords"])
-        key = _pair_key(orient, text)
 
-        if kind == "dim_text":
-            # New-format dim_text has empty orient; allow matching dim_target via text key.
-            if pending_geom[key]:
-                gkind, gcoords = pending_geom[key].popleft()
-                emit(orient, text, coords, gkind, gcoords)
-            else:
-                pending_text[key].append((orient, coords))
-        elif kind in ("dim_axis", "dim_target"):
-            if pending_text[key]:
-                text_orient, vb = pending_text[key].popleft()
-                emit(orient or text_orient, text, vb, kind, coords)
-            else:
-                pending_geom[key].append((kind, coords))
+def refs_to_matches(atoms: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pair adjacent ``dim_text`` → ``dim_axis|dim_target`` with the same VALUE.
 
+    Matches ``data-detect-rule.md``: do not globally re-pair by value string.
+    """
+    matches: list[dict[str, Any]] = []
+    i = 0
+    n = len(atoms)
+    while i < n:
+        cur = atoms[i]
+        if (
+            cur["kind"] == "dim_text"
+            and i + 1 < n
+            and atoms[i + 1]["kind"] in ("dim_axis", "dim_target")
+            and atoms[i + 1]["value_text"] == cur["value_text"]
+        ):
+            mate = atoms[i + 1]
+            item = _emit_dimension_match(
+                cur["value_text"],
+                list(cur["coords"]),
+                mate["kind"],
+                list(mate["coords"]),
+            )
+            if item is not None:
+                matches.append(item)
+            i += 2
+            continue
+        i += 1
     return matches
 
 
@@ -402,7 +428,28 @@ def parse_dimension_matches_from_locany(
 ) -> list[dict[str, Any]]:
     del label  # unused; kept for call-site compatibility
     cleaned = SPECIAL_TOKEN_RE.sub("", text or "").strip()
-    return refs_to_matches(parse_locany_refs(cleaned))
+    return refs_to_matches(parse_locany_dim_atoms(cleaned))
+
+
+def parse_pad_hole_from_locany(text: str) -> list[dict[str, Any]]:
+    """Parse class-major LocAny pad/hole output → ``[{type,bbox},...]``.
+
+    Canonical form (``data-detect-rule.md``)::
+
+        <ref>SMD Pad</ref><box>...</box><box>...</box>
+        <ref>Locating Hole</ref><box>...</box>...
+    """
+    cleaned = SPECIAL_TOKEN_RE.sub("", text or "").strip()
+    items: list[dict[str, Any]] = []
+    for ref_raw, coords_list in iter_ref_chunks(cleaned):
+        typ = PAD_HOLE_REF_TO_TYPE.get(ref_raw.strip().lower())
+        if typ is None:
+            continue
+        for coords in coords_list:
+            if len(coords) != 4:
+                continue
+            items.append({"type": typ, "bbox": _norm_xyxy(coords)})
+    return items
 
 
 def reparse_prediction_jsonl(
@@ -410,12 +457,12 @@ def reparse_prediction_jsonl(
     output_path: str | None = None,
     **_kwargs,
 ) -> dict[str, int]:
-    """Re-parse model_response → model_result for an existing pred JSONL."""
+    """Re-parse model_response / pad_hole_response on an existing pred JSONL."""
     in_path = Path(input_path)
     out_path = Path(output_path) if output_path else in_path
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    n_rows = n_pairs = n_empty = 0
+    n_rows = n_dim = n_ph = n_empty_dim = n_empty_ph = 0
     rows_out: list[dict[str, Any]] = []
     with in_path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -425,21 +472,39 @@ def reparse_prediction_jsonl(
             row = json.loads(line)
             n_rows += 1
             response = row.get("model_response") or row.get("raw_response") or ""
-            model_result = parse_dimension_matches_from_locany(response)
-            row["model_result"] = model_result
-            if not model_result:
-                n_empty += 1
-            n_pairs += len(model_result)
+            if response or "model_result" in row:
+                model_result = parse_dimension_matches_from_locany(response)
+                row["model_result"] = model_result
+                n_dim += len(model_result)
+                if not model_result:
+                    n_empty_dim += 1
+            ph_resp = row.get("pad_hole_response") or ""
+            if ph_resp or "pad_hole_result" in row:
+                ph_result = parse_pad_hole_from_locany(ph_resp)
+                row["pad_hole_result"] = ph_result
+                n_ph += len(ph_result)
+                if not ph_result:
+                    n_empty_ph += 1
+            # Keep GT field names aligned with test_dimension_pad_hole.jsonl
+            if "dimension_label" not in row and "label" in row:
+                row["dimension_label"] = row.get("label") or []
+            row.setdefault("pad_hole_label", row.get("pad_hole_label") or [])
             rows_out.append(row)
 
     with out_path.open("w", encoding="utf-8") as f:
         for row in rows_out:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    stats = {"rows": n_rows, "pred_pairs": n_pairs, "empty_pred": n_empty}
+    stats = {
+        "rows": n_rows,
+        "dim_pairs": n_dim,
+        "dim_empty": n_empty_dim,
+        "pad_hole_boxes": n_ph,
+        "pad_hole_empty": n_empty_ph,
+    }
     print(
         f"[reparse] {in_path} → {out_path} | "
-        f"rows={n_rows} pairs={n_pairs} empty={n_empty}"
+        f"rows={n_rows} dim_pairs={n_dim} pad_hole_boxes={n_ph}"
     )
     return stats
 
@@ -603,7 +668,7 @@ def _format_sample_log(
         f"[Rank {rank}] ID={sample_id}",
         (
             f"  tokens={gen.get('num_tokens')}  steps={gen.get('num_steps')}  "
-            f"refs={n_ref}  boxes={n_box}  pred_pairs={n_pred}  gt_pairs={n_gt}"
+            f"refs={n_ref}  boxes={n_box}  pred={n_pred}  gt={n_gt}"
         ),
     ]
     if gen.get("gen_info"):
@@ -792,16 +857,20 @@ def main():
 
     rank, world_size, local_rank = setup_distributed()
     device = f"cuda:{local_rank}" if local_rank >= 0 else "cuda"
-    prompt = load_prompt(args)
+    prompts = load_prompts(args)
+    run_dimension = args.task in ("dimension", "both")
+    run_pad_hole = args.task in ("pad_hole", "both")
 
     if is_main_process():
-        print("=== PCB Dimension Match DDP Inference ===")
+        print("=== PCB LocAny DDP Inference ===")
+        print(f"Task: {args.task}")
         print(f"World Size: {world_size}")
         print(f"Model Path: {args.model_path}")
         print(f"Test JSONL: {args.test_jsonl_path}")
         print(f"Save Path: {args.save_path}")
         print(f"Generation Mode: {args.generation_mode}")
-        print(f"Prompt:\n{prompt}\n")
+        for name, text in prompts.items():
+            print(f"Prompt[{name}]:\n{text}\n")
 
     save_dir = os.path.dirname(args.save_path)
     if is_main_process() and save_dir:
@@ -836,19 +905,26 @@ def main():
     local_predictions: list[dict] = []
     iterator = tqdm(dataloader, desc=f"Rank {rank}", disable=not is_main_process())
 
+    def _empty_pred(sample: dict, error: str | None = None) -> dict:
+        row = {
+            "ID": sample["ID"],
+            "image_path": sample["image_path"],
+            **_gt_fields_from_sample(sample),
+            "model_response": "",
+            "model_result": [],
+            "pad_hole_response": "",
+            "pad_hole_result": [],
+        }
+        if error:
+            row["error"] = error
+        return row
+
     for sample in iterator:
         full_image_path = sample["full_image_path"]
         if not full_image_path or not os.path.exists(full_image_path):
             print(f"[Rank {rank}] Warning: Image not found: {full_image_path}")
             local_predictions.append(
-                {
-                    "ID": sample["ID"],
-                    "image_path": sample["image_path"],
-                    "model_response": "",
-                    "model_result": [],
-                    **_gt_fields_from_sample(sample),
-                    "error": f"image_not_found: {full_image_path}",
-                }
+                _empty_pred(sample, error=f"image_not_found: {full_image_path}")
             )
             continue
 
@@ -856,76 +932,94 @@ def main():
             image = Image.open(full_image_path).convert("RGB")
         except Exception as e:
             print(f"[Rank {rank}] Error loading image {full_image_path}: {e}")
-            local_predictions.append(
-                {
-                    "ID": sample["ID"],
-                    "image_path": sample["image_path"],
-                    "model_response": "",
-                    "model_result": [],
-                    **_gt_fields_from_sample(sample),
-                    "error": str(e),
-                }
-            )
+            local_predictions.append(_empty_pred(sample, error=str(e)))
             continue
 
         if args.short_side_size is not None:
             image, _ = resize_image_short_side(image, args.short_side_size)
 
-        try:
-            gen = worker.generate(
-                image,
-                prompt,
-                max_new_tokens=args.max_new_tokens,
-                verbose=True,
-            )
-            output = gen["text"]
-        except Exception as e:
-            print(f"[Rank {rank}] Generate failed for {sample['ID']}: {e}")
-            local_predictions.append(
-                {
-                    "ID": sample["ID"],
-                    "image_path": sample["image_path"],
-                    "model_response": "",
-                    "model_result": [],
-                    **_gt_fields_from_sample(sample),
-                    "error": f"generate_failed: {e}",
-                }
-            )
-            continue
+        row = _empty_pred(sample)
+        total_tokens = 0
+        total_steps = 0
 
-        try:
-            model_result = parse_dimension_matches_from_locany(output)
-        except Exception as e:
-            print(f"[Rank {rank}] Parse failed for {sample['ID']}: {e}")
-            model_result = []
-
-        if args.print_sample:
-            log_block = _format_sample_log(
-                rank=rank,
-                sample_id=sample["ID"],
-                gen=gen,
-                model_result=model_result,
-                label=sample["dimension_label"],
-                print_max_chars=args.print_max_chars,
-                print_history=args.print_history,
-            )
-            # Avoid breaking tqdm progress bar layout.
+        if run_dimension:
             try:
-                iterator.write(log_block)
-            except Exception:
-                print(log_block, flush=True)
+                gen = worker.generate(
+                    image,
+                    prompts["dimension"],
+                    max_new_tokens=args.max_new_tokens,
+                    verbose=True,
+                )
+                output = gen["text"]
+                row["model_response"] = output if isinstance(output, str) else str(output)
+                try:
+                    row["model_result"] = parse_dimension_matches_from_locany(output)
+                except Exception as e:
+                    print(f"[Rank {rank}] Dimension parse failed for {sample['ID']}: {e}")
+                    row["model_result"] = []
+                total_tokens += int(gen.get("num_tokens") or 0)
+                total_steps += int(gen.get("num_steps") or 0)
+                if args.print_sample:
+                    log_block = _format_sample_log(
+                        rank=rank,
+                        sample_id=f"{sample['ID']}[dimension]",
+                        gen=gen,
+                        model_result=row["model_result"],
+                        label=sample["dimension_label"],
+                        print_max_chars=args.print_max_chars,
+                        print_history=args.print_history,
+                    )
+                    try:
+                        iterator.write(log_block)
+                    except Exception:
+                        print(log_block, flush=True)
+            except Exception as e:
+                print(f"[Rank {rank}] Dimension generate failed for {sample['ID']}: {e}")
+                row["error"] = f"dimension_generate_failed: {e}"
 
-        local_predictions.append(
-            {
-                "ID": sample["ID"],
-                "image_path": sample["image_path"],
-                "model_response": output if isinstance(output, str) else str(output),
-                "model_result": model_result,
-                **_gt_fields_from_sample(sample),
-                "num_tokens": gen.get("num_tokens"),
-                "num_steps": gen.get("num_steps"),
-            }
-        )
+        if run_pad_hole:
+            try:
+                gen = worker.generate(
+                    image,
+                    prompts["pad_hole"],
+                    max_new_tokens=args.max_new_tokens,
+                    verbose=True,
+                )
+                output = gen["text"]
+                row["pad_hole_response"] = output if isinstance(output, str) else str(output)
+                try:
+                    row["pad_hole_result"] = parse_pad_hole_from_locany(output)
+                except Exception as e:
+                    print(f"[Rank {rank}] Pad/hole parse failed for {sample['ID']}: {e}")
+                    row["pad_hole_result"] = []
+                total_tokens += int(gen.get("num_tokens") or 0)
+                total_steps += int(gen.get("num_steps") or 0)
+                if args.print_sample:
+                    log_block = _format_sample_log(
+                        rank=rank,
+                        sample_id=f"{sample['ID']}[pad_hole]",
+                        gen=gen,
+                        model_result=row["pad_hole_result"],
+                        label=sample.get("pad_hole_label") or [],
+                        print_max_chars=args.print_max_chars,
+                        print_history=args.print_history,
+                    )
+                    try:
+                        iterator.write(log_block)
+                    except Exception:
+                        print(log_block, flush=True)
+            except Exception as e:
+                print(f"[Rank {rank}] Pad/hole generate failed for {sample['ID']}: {e}")
+                prev = row.get("error")
+                row["error"] = (
+                    f"{prev}; pad_hole_generate_failed: {e}"
+                    if prev
+                    else f"pad_hole_generate_failed: {e}"
+                )
+
+        row["num_tokens"] = total_tokens or None
+        row["num_steps"] = total_steps or None
+        local_predictions.append(row)
 
     print(f"[Rank {rank}] Finished {len(local_predictions)} samples")
 
@@ -954,7 +1048,6 @@ def main():
                         all_predictions.append(json.loads(line))
             os.remove(r_path)
 
-        # Stable order by original test list if possible
         id_order = {
             (row.get("ID") or row.get("id") or Path(row.get("image_path", "")).name): i
             for i, row in enumerate(test_data)
@@ -966,14 +1059,37 @@ def main():
                 f.write(json.dumps(pred, ensure_ascii=False) + "\n")
         print(f"Saved {len(all_predictions)} predictions to {args.save_path}")
 
-        n_empty = sum(1 for p in all_predictions if not p.get("model_result"))
-        n_pairs = sum(len(p.get("model_result") or []) for p in all_predictions)
-        n_gt = sum(
-            len(p.get("dimension_label") or p.get("label") or [])
-            for p in all_predictions
-        )
-        print(f"Summary: samples={len(all_predictions)} empty_pred={n_empty} "
-              f"pred_pairs={n_pairs} gt_pairs={n_gt}")
+        if run_dimension:
+            n_empty = sum(1 for p in all_predictions if not p.get("model_result"))
+            n_pairs = sum(len(p.get("model_result") or []) for p in all_predictions)
+            n_gt = sum(
+                len(p.get("dimension_label") or p.get("label") or [])
+                for p in all_predictions
+            )
+            print(
+                f"Dimension summary: samples={len(all_predictions)} empty_pred={n_empty} "
+                f"pred_pairs={n_pairs} gt_pairs={n_gt}"
+            )
+
+        if run_pad_hole:
+            from pad_hole_metrics import build_pad_hole_summary, print_pad_hole_table
+
+            n_empty = sum(1 for p in all_predictions if not p.get("pad_hole_result"))
+            n_pred = sum(len(p.get("pad_hole_result") or []) for p in all_predictions)
+            n_gt = sum(len(p.get("pad_hole_label") or []) for p in all_predictions)
+            print(
+                f"Pad/hole summary: samples={len(all_predictions)} empty_pred={n_empty} "
+                f"pred_boxes={n_pred} gt_boxes={n_gt}"
+            )
+            summary = build_pad_hole_summary(all_predictions, iou_report=0.5)
+            print("=== Pad/Hole detection metrics (norm1000, IoU@0.5 for Box P/R) ===")
+            print_pad_hole_table(summary)
+            metrics_path = Path(args.save_path).with_suffix(".pad_hole_metrics.json")
+            metrics_path.write_text(
+                json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            print(f"Wrote pad/hole metrics: {metrics_path}")
 
     cleanup_distributed()
 

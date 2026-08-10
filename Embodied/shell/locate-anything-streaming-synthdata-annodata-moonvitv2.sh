@@ -21,13 +21,13 @@ cd "$ROOT"
 # =============================================================================
 export WANDB_API_KEY="${WANDB_API_KEY:-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}"
 export WANDB_PROJECT="${WANDB_PROJECT:-pad_dimension_and_pad_hole}"
-export WANDB_NAME="${WANDB_NAME:-locateanything-3b-moonvitv2-synthdatav4mixckpt6000-annodata}"
+export WANDB_NAME="${WANDB_NAME:-locateanything-3b-moonvitv2-synthdatav4mixckpt6000-xycorneroder-annodata}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
 
 # =============================================================================
 # Paths / model / data
 # =============================================================================
-MODEL_PATH=${MODEL_PATH:-"/workspace/models/CheckPoints/pad_dimension_and_pad_hole/locateanything-3b-moonvitv2-synthdata-v4-mix/checkpoint-6000/"}
+MODEL_PATH=${MODEL_PATH:-"/workspace/models/CheckPoints/pad_dimension_and_pad_hole/locateanything-3b-moonvitv2-synthdatav4mix-xycorneroder/milestones/checkpoint-6000"}
 META_PATH=${META_PATH:-"data/recipe/recipe_anno_mix.json"}
 # Must omit DeepSpeed "optimizer" when using --lr_scale (HF creates param-group AdamW).
 DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-"deepspeed_configs/zero_stage1_config_lr_scale.json"}

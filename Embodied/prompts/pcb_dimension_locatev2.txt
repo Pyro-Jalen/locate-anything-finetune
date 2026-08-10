@@ -1,0 +1,5 @@
+Please locate the text referred as Dimension Value.
+Locate all the instances that matches the following description: horizontal dimension line</c>vertical dimension line</c>arbitrary dimension line.
+Locate a single instance that matches the following description: grid cell.
+Point to: leader line related PCB footprint.
+Pair each Dimension Value with its Dimension Line, Leader target, or Grid Cell.
