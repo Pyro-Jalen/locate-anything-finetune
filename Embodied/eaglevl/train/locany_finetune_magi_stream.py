@@ -56,7 +56,7 @@ from eaglevl.train.constants import (
 from eaglevl.train.arguments import ModelArguments, DataTrainingArguments
 from eaglevl.train.trainer_monkey_patch import replace_create_optimizer_with_various_lr
 from PIL import Image, ImageFile, PngImagePlugin
-from torch.utils.data import Dataset, IterableDataset, DataLoader
+from torch.utils.data import ConcatDataset, Dataset, IterableDataset, DataLoader
 from transformers import (AutoConfig, AutoModelForCausalLM, AutoTokenizer,
                           HfArgumentParser, Trainer, TrainingArguments,
                           set_seed, AutoProcessor)
@@ -1058,6 +1058,51 @@ class PackedCollatorMTP:
         return packed_collate_fn_mtp(features, dataset=self.dataset)
 
 
+def _merge_eval_samples(batch: Optional[dict], sample: dict) -> dict:
+    """Merge map-style eval samples into one packed sequence (train layout)."""
+    sample_len = int(sample['input_ids'].size(0))
+    sample = {k: v for k, v in sample.items() if k != 'attention_mask'}
+
+    if batch is None:
+        result = copy.copy(sample)
+        result['_sample_lengths'] = [sample_len]
+        return result
+
+    result = {}
+    for k in batch:
+        if k == '_sample_lengths':
+            result[k] = batch[k] + [sample_len]
+        elif k == 'image_grid_hws':
+            if isinstance(batch[k], np.ndarray) and isinstance(sample[k], np.ndarray):
+                result[k] = np.concatenate([batch[k], sample[k]], axis=0)
+            else:
+                result[k] = torch.cat([batch[k], sample[k]])
+        elif k == 'pixel_values':
+            result[k] = torch.cat([batch[k], sample[k]])
+        elif isinstance(batch[k], torch.Tensor):
+            result[k] = torch.cat([batch[k], sample[k]])
+        else:
+            result[k] = batch[k]
+    return result
+
+
+class EvalPackedCollatorMTP:
+    """Pack a finite map-style eval batch into the same layout as stream packing."""
+
+    def __call__(self, features: List[dict]) -> dict:
+        if len(features) == 0:
+            raise ValueError("EvalPackedCollatorMTP received an empty batch")
+
+        packed = None
+        for sample in features:
+            packed = _merge_eval_samples(packed, sample)
+
+        packed['sub_sample_lengths'] = torch.tensor(
+            packed.pop('_sample_lengths'), dtype=torch.long
+        )
+        return packed_collate_fn_mtp([packed], dataset=None)
+
+
 class StateAwareDataLoader:
     """Wrapper around DataLoader to capture state snapshots from worker processes."""
     def __init__(self, dataloader, dataset: StreamPackedDatasetMTP):
@@ -1137,6 +1182,7 @@ class StreamPackingMTPTrainer(Trainer):
         self._total_samples = 0
         self._sample_log_interval = sample_log_interval
         self._start_step = None  # 记录开始的step，用于resume时正确计算平均值
+        self._eval_collator = EvalPackedCollatorMTP()
     
     def training_step(self, model, inputs, num_items_in_batch=None):
         # 记录开始的step（用于resume时正确计算平均值）
@@ -1189,6 +1235,30 @@ class StreamPackingMTPTrainer(Trainer):
         )
         
         return StateAwareDataLoader(dataloader, self.train_dataset)
+
+    def get_eval_dataloader(self, eval_dataset=None):
+        if eval_dataset is None:
+            eval_dataset = self.eval_dataset
+        if eval_dataset is None:
+            raise ValueError("Trainer: evaluation requires an eval_dataset.")
+
+        from torch.utils.data import DataLoader
+
+        dataloader_params = {
+            'batch_size': self.args.per_device_eval_batch_size,
+            'collate_fn': self._eval_collator,
+            'num_workers': self.args.dataloader_num_workers,
+            'pin_memory': self.args.dataloader_pin_memory,
+            'prefetch_factor': (
+                self.args.dataloader_prefetch_factor
+                if self.args.dataloader_num_workers > 0 else None
+            ),
+        }
+        if not isinstance(eval_dataset, torch.utils.data.IterableDataset):
+            dataloader_params['sampler'] = self._get_eval_sampler(eval_dataset)
+            dataloader_params['drop_last'] = self.args.dataloader_drop_last
+
+        return self.accelerator.prepare(DataLoader(eval_dataset, **dataloader_params))
 
 
 def build_stream_packed_dataset_mtp(
@@ -1249,6 +1319,47 @@ def build_stream_packed_dataset_mtp(
         base_seed=base_seed,
         buffer_size=buffer_size,
     )
+
+
+def build_eval_dataset_mtp(
+    model_args,
+    data_args,
+    processor,
+) -> Optional[Dataset]:
+    """Build a finite map-style eval dataset from eval_meta_path (optional)."""
+    eval_meta_path = getattr(data_args, 'eval_meta_path', None)
+    if not eval_meta_path:
+        return None
+
+    ds_collections = json.loads(open(eval_meta_path).read())
+    datasets = []
+
+    for ds_name, meta in ds_collections.items():
+        repeat_time = meta.get('repeat_time', 1)
+        try:
+            ds = LazySupervisedDatasetMTP(
+                ds_name, meta, processor,
+                block_size=model_args.block_size,
+                repeat_time=repeat_time,
+                target_fps=data_args.target_fps,
+                max_frames=data_args.max_frames,
+                video_total_pixels=data_args.video_total_pixels,
+            )
+            if len(ds) == 0:
+                logger.warning(f'Eval dataset {ds_name} is empty, skipping.')
+                continue
+            datasets.append(ds)
+            logger.info(f'Added eval dataset: {ds_name}, length={len(ds)}')
+        except Exception as e:
+            traceback.print_exc()
+            logger.error(f'Error loading eval dataset {ds_name}: {e}')
+            raise
+
+    if len(datasets) == 0:
+        raise ValueError(f"No valid eval datasets found in {eval_meta_path}")
+    if len(datasets) == 1:
+        return datasets[0]
+    return ConcatDataset(datasets)
 
 
 def main():
@@ -1495,6 +1606,19 @@ def main():
     train_dataset = build_stream_packed_dataset_mtp(model_args, data_args, processor, base_seed=training_args.seed)
     logger.info(f"Dataset built in {time.time() - t_start:.2f}s")
 
+    eval_dataset = None
+    if getattr(data_args, 'eval_meta_path', None):
+        logger.info(f"Building eval dataset from {data_args.eval_meta_path}...")
+        t_start = time.time()
+        eval_dataset = build_eval_dataset_mtp(model_args, data_args, processor)
+        logger.info(
+            f"Eval dataset built in {time.time() - t_start:.2f}s, "
+            f"length={len(eval_dataset)}"
+        )
+        if not training_args.do_eval:
+            training_args.do_eval = True
+            logger.info("Enabled do_eval=True because eval_meta_path was provided")
+
     # Freeze params
     def _freeze_params(module):
         for param in module.parameters():
@@ -1579,7 +1703,7 @@ def main():
         model=model,
         args=training_args,
         train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=None,
+        eval_dataset=eval_dataset,
         data_collator=collate_fn,
         callbacks=my_callbacks,
         processing_class=processor,

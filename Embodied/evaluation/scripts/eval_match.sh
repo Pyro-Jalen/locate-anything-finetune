@@ -17,12 +17,13 @@ PORT=${PORT:-29510}
 GENERATION_MODE=${GENERATION_MODE:-"slow"} # hybrid/ fast/ slow
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-1024}
 LIMIT=${LIMIT:-}
-TASK=${TASK:-both}
+TASK=${TASK:-dimension}
 
-MODEL_PATH=${MODEL_PATH:-"/workspace/models/CheckPoints/pad_dimension_and_pad_hole/locateanything-3b-moonvitv2-synthdatav4mixckpt6000-xycorneroder-annodatackpt2600-cont-onlypcbdimension/checkpoint-2800/"}
+MODEL_PATH=${MODEL_PATH:-"/workspace/models/CheckPoints/pad_dimension_and_pad_hole/locateanything-3b-moonvitv2-annodata/milestones/checkpoint-3000/"}
 TEST_JSONL=${TEST_JSONL:-"/workspace/PROJECTS/github/Eagle/Embodied/data/test/test.jsonl"}
 IMAGE_ROOT=${IMAGE_ROOT:-""}
-SAVE_PATH=${SAVE_PATH:-"/workspace/PROJECTS/pad_detect/results/size_line_value_match/locate_anything/locateanything-3b-moonvitv2-full-${GENERATION_MODE}-${TASK}-synthdatav4mixckpt6000-xycorneroder-annodatackpt2800-cont-onlypcbdimensionckpt2600.jsonl"}
+# SAVE_PATH=${SAVE_PATH:-"/workspace/PROJECTS/pad_detect/results/size_line_value_match/locate_anything/locateanything-3b-moonvitv2-full-${GENERATION_MODE}-${TASK}-synthdatav5ckpt6000.jsonl"}
+SAVE_PATH=${SAVE_PATH:-"/workspace/PROJECTS/pad_detect/results/size_line_value_match/locate_anything/locateanything-3b-moonvitv2-full-${GENERATION_MODE}-${TASK}-annodatackpt3000.jsonl"}
 DIMENSION_PROMPT=${DIMENSION_PROMPT:-""}
 PAD_HOLE_PROMPT=${PAD_HOLE_PROMPT:-""}
 RUN_REWARD=${RUN_REWARD:-1}

@@ -146,6 +146,15 @@ class DataTrainingArguments:
         default=None,
         metadata={'help': 'The path of the meta file of datasets.'},
     )
+    eval_meta_path: Optional[str] = field(
+        default=None,
+        metadata={
+            'help': (
+                'Optional recipe json for eval/loss. If unset, no eval dataset is built '
+                'and training-time evaluation is skipped.'
+            )
+        },
+    )
     neftune_alpha: Optional[float] = field(
         default=None,
         metadata={'help': 'The noise_alpha value for NEFTune. Default is None.'},

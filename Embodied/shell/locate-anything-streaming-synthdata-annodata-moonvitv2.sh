@@ -21,14 +21,19 @@ cd "$ROOT"
 # =============================================================================
 export WANDB_API_KEY="${WANDB_API_KEY:-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}"
 export WANDB_PROJECT="${WANDB_PROJECT:-pad_dimension_and_pad_hole}"
-export WANDB_NAME="${WANDB_NAME:-locateanything-3b-moonvitv2-synthdatav4mixckpt6000-xycorneroder-annodata}"
+export WANDB_NAME="${WANDB_NAME:-locateanything-3b-moonvitv2-annodata}"
 export WANDB_RESUME="${WANDB_RESUME:-allow}"
 
 # =============================================================================
 # Paths / model / data
 # =============================================================================
-MODEL_PATH=${MODEL_PATH:-"/workspace/models/CheckPoints/pad_dimension_and_pad_hole/locateanything-3b-moonvitv2-synthdatav4mix-xycorneroder/milestones/checkpoint-6000"}
-META_PATH=${META_PATH:-"data/recipe/recipe_anno_mix.json"}
+MODEL_PATH=${MODEL_PATH:-"/workspace/models/CommonModels/LocateAnything-3B-MoonViTV2"}
+META_PATH=${META_PATH:-"data/recipe/recipe_train_anno_pcb_dimension.json"}
+# Optional. Empty = no train-time eval. Example:
+#   EVAL_META_PATH=data/recipe/recipe_eval_pcb_test.json
+EVAL_META_PATH=${EVAL_META_PATH:-"data/recipe/recipe_eval_anno_pcb_dimension.json"}
+EVAL_STEPS=${EVAL_STEPS:-20}
+PER_DEVICE_EVAL_BATCH_SIZE=${PER_DEVICE_EVAL_BATCH_SIZE:-1}
 # Must omit DeepSpeed "optimizer" when using --lr_scale (HF creates param-group AdamW).
 DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-"deepspeed_configs/zero_stage1_config_lr_scale.json"}
 
@@ -53,8 +58,8 @@ FREEZE_BACKBONE=${FREEZE_BACKBONE:-False} # vision_model (MoonViT-V2)
 # Learning rate  (aligned with v1 annodata continue)
 # actual_lr = LR * scale → ViT 2.5e-6 | MLP 5e-6 | LLM 5e-6
 # =============================================================================
-LR=${LR:-5e-6}
-LR_SCALE=${LR_SCALE:-"vision_model: 0.5, mlp: 1.0, llm: 1.0"}
+LR=${LR:-1e-5}
+LR_SCALE=${LR_SCALE:-"vision_model: 1.0, mlp: 1.0, llm: 1.0"}
 
 # =============================================================================
 # Schedule  (aligned with locate-anything-streaming-synthdata-annodata.sh)
@@ -64,8 +69,8 @@ WARMUP_RATIO=${WARMUP_RATIO:-0.01}
 if [ -z "${WARMUP_STEPS:-}" ]; then
   WARMUP_STEPS="$(python -c "print(max(1, int(${MAX_STEPS} * ${WARMUP_RATIO})))")"
 fi
-SAVE_STEPS=${SAVE_STEPS:-200}
-SAVE_LIMIT=${SAVE_LIMIT:-3}
+SAVE_STEPS=${SAVE_STEPS:-1000}
+SAVE_LIMIT=${SAVE_LIMIT:-1}
 MILESTONE_INTERVAL=${MILESTONE_INTERVAL:-1000}
 
 # =============================================================================
@@ -112,6 +117,7 @@ echo " LocateAnything Magi SFT continue (MoonViT-V2 synth → anno)"
 echo "------------------------------------------------------------"
 echo " MODEL_PATH          = ${MODEL_PATH}"
 echo " META_PATH           = ${META_PATH}"
+echo " EVAL_META_PATH      = ${EVAL_META_PATH:-<disabled>}"
 echo " OUTPUT_DIR          = ${OUTPUT_DIR}"
 echo " LOG_FILE            = ${LOG_FILE}"
 echo " GPUS/NNODES         = ${GPUS} / ${NNODES}  (rank=${NODE_RANK})"
@@ -122,11 +128,26 @@ echo " MAX_STEPS           = ${MAX_STEPS}"
 echo " WARMUP              = steps=${WARMUP_STEPS}  (ratio=${WARMUP_RATIO})"
 echo " SAVE                = steps=${SAVE_STEPS}  limit=${SAVE_LIMIT}  milestone=${MILESTONE_INTERVAL}"
 echo " BATCH               = per_device=${PER_DEVICE_BATCH_SIZE}  grad_acc=${GRADIENT_ACC}"
+if [ -n "${EVAL_META_PATH}" ]; then
+  echo " EVAL                = steps=${EVAL_STEPS}  per_device=${PER_DEVICE_EVAL_BATCH_SIZE}"
+fi
 echo " WANDB               = project=${WANDB_PROJECT}  name=${WANDB_NAME}"
 echo " python              = $(command -v python)"
 echo "============================================================"
 
 run_train() {
+  local -a extra_eval_args=()
+  if [ -n "${EVAL_META_PATH}" ]; then
+    extra_eval_args=(
+      --eval_meta_path "$EVAL_META_PATH"
+      --do_eval True
+      --eval_strategy steps
+      --eval_steps "$EVAL_STEPS"
+      --per_device_eval_batch_size "$PER_DEVICE_EVAL_BATCH_SIZE"
+      --prediction_loss_only True
+    )
+  fi
+
   LAUNCHER=pytorch python -m torch.distributed.run \
     --nnodes="$NNODES" \
     --node_rank="$NODE_RANK" \
@@ -174,7 +195,8 @@ run_train() {
     --group_by_length False \
     --report_to "wandb" \
     --run_name "$WANDB_NAME" \
-    --use_onelogger True
+    --use_onelogger True \
+    "${extra_eval_args[@]}"
 }
 
 if [ "${_MAGI_TRAIN_INNER:-0}" = 1 ] || [ "${TRAIN_LAUNCHER_MANAGED:-0}" = 1 ]; then
